@@ -233,6 +233,7 @@ module LDT_pluginIndices
    character*50, public, parameter :: LDT_gtopoNATId = "GTOPO30_Native"
    character*50, public, parameter :: LDT_srtmLISId  = "SRTM_LIS"
    character*50, public, parameter :: LDT_srtmNATId  = "SRTM_Native"
+   character*50, public, parameter :: LDT_merit1KId  = "MERIT_1K"
 
 !-------------------------------------------------------------------------
 ! Soils sources
