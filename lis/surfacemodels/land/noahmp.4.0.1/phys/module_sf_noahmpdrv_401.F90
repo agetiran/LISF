@@ -48,6 +48,8 @@ CONTAINS
 !                 BEXP_3D,SMCDRY_3D,SMCWLT_3D,SMCREF_3D,SMCMAX_3D,          & ! placeholders to activate 3D soil
 !		 DKSAT_3D,DWSAT_3D,PSISAT_3D,QUARTZ_3D,                     &
 !		 REFDK_2D,REFKDT_2D,                                        &
+              !ag (05Jan2021)
+              rivstoxy,fldstoxy,fldfrcxy,                                   &
 #ifdef WRF_HYDRO
                sfcheadrt,INFXSRT,soldrain,                                  &
 #endif
@@ -465,7 +467,11 @@ CONTAINS
     
     type(noahmp_parameters) :: parameters
 
-
+    !ag (05Jan2021)
+    REAL,    DIMENSION( ims:ime,          jms:jme ), INTENT(IN   ) ::  rivstoxy !river storage [m -1]
+    REAL,    DIMENSION( ims:ime,          jms:jme ), INTENT(IN   ) ::  fldstoxy  !flood storage [m -1]
+    REAL,    DIMENSION( ims:ime,          jms:jme ), INTENT(IN   ) ::  fldfrcxy  !flooded fraction flag (zero or 1)
+    REAL                                                           :: rivsto, fldsto,fldfrc
 ! ----------------------------------------------------------------------
 
     CALL NOAHMP_OPTIONS(IDVEG  ,IOPT_CRS  ,IOPT_BTR  ,IOPT_RUN  ,IOPT_SFC  ,IOPT_FRZ , &
@@ -593,6 +599,11 @@ CONTAINS
          PRCPGRPL  = 0.
          PRCPHAIL  = 0.
        ENDIF
+
+       !ag(05Jan2021)
+       rivsto=rivstoxy(i,j)
+       fldsto=fldstoxy(i,j)
+       fldfrc=fldfrcxy(i,j)
 
 ! IN/OUT fields
 
@@ -885,6 +896,8 @@ CONTAINS
 	    GHB     , IRG     , IRC     , IRB     , TR      , EVC     , & ! OUT :
 	    CHLEAF  , CHUC    , CHV2    , CHB2    , FPICE   , PAHV    , & 
             PAHG    , PAHB    , PAH     , LAISUN  , LAISHA  , RB        &
+            !ag (05Jan2021)
+            ,rivsto  , fldsto, fldfrc            &
 #ifdef WRF_HYDRO
             , sfcheadrt(i,j)                               &
 #endif

@@ -41,14 +41,7 @@ subroutine noahmp401_getsws_hymap2(n)
   integer                :: c,r
   integer                :: status
   integer                :: enable2waycpl
-  
-  enable2waycpl = 0 
 
-  if(enable2waycpl==1) then 
-     write(LIS_logunit,*) '[ERR] The noahmp401_getsws_hymap2 is not implemented'
-     call LIS_endrun()
-  endif
-#if 0 
   call ESMF_AttributeGet(LIS_runoff_state(n),"2 way coupling",&
        enable2waycpl, rc=status)
   call LIS_verify(status)
@@ -80,6 +73,5 @@ subroutine noahmp401_getsws_hymap2(n)
      call LIS_verify(status,'ESMF_FieldGet failed for Flooded Fraction')
      NOAHMP401_struc(n)%noahmp401(:)%fldfrc=fldfrctmp
   endif  
-#endif
 
 end subroutine noahmp401_getsws_hymap2

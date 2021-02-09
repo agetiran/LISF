@@ -883,8 +883,8 @@ contains
   LOGICAL                             :: FROZEN_CANOPY ! used to define latent heat pathway
   
   !ag (12Sep2019)
-  REAL                        , INTENT(IN)    :: rivsto  !river storage
-  REAL                        , INTENT(IN)    :: fldsto  !flood storage
+  REAL                        , INTENT(IN)    :: rivsto  !river storage [m -1]
+  REAL                        , INTENT(IN)    :: fldsto  !flood storage [m -1]
   REAL                        , INTENT(IN)    :: fldfrc  !flooded fraction flag (zero or 1)
 
   ! INTENT (OUT) variables need to be assigned a value.  These normally get assigned values
@@ -6758,10 +6758,6 @@ END SUBROUTINE ALBEDO_UPD
   REAL                              , INTENT(IN)   :: LATHEAG !latent heat vap./sublimation (j/kg)
   LOGICAL                           , INTENT(IN)   :: FROZEN_GROUND ! used to define latent heat pathway
   LOGICAL                           , INTENT(IN)   :: FROZEN_CANOPY ! used to define latent heat pathway
-  !ag (12Sep2019)
-  REAL                              , INTENT(IN)   :: rivsto 
-  REAL                              , INTENT(IN)   :: fldsto 
-  REAL                             , INTENT(IN)   :: fldfrc 
 
   INTEGER,                         INTENT(IN)    :: ISURBAN
 
@@ -6781,6 +6777,11 @@ END SUBROUTINE ALBEDO_UPD
   REAL                                           :: FCRMAX !maximum of FCR (-)
 
   REAL, PARAMETER ::  WSLMAX = 5000.      !maximum lake water storage (mm)
+
+  !ag (12Sep2019)
+  REAL                              , INTENT(IN)   :: rivsto
+  REAL                              , INTENT(IN)   :: fldsto
+  REAL                             , INTENT(IN)   :: fldfrc
 
 #ifdef WRF_HYDRO
   REAL                           , INTENT(INOUT)    :: sfcheadrt

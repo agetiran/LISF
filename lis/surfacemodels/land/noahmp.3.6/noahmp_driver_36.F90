@@ -294,10 +294,10 @@ subroutine noahmp_driver_36(iloc, jloc, &
   real,   intent(out) :: chb2                 ! sensible heat exchange coefficient over bare-ground [-] 
   real,   intent(out) :: fpice                ! snow fraction in precipitation [-] 
   !ag (12Sep2019)
-  real, intent(inout) :: rivsto               ! river storage
-  real, intent(inout) :: fldsto               ! flood storage
-  real, intent(inout) :: fldfrc               ! flood storage
-  
+  real,   intent(in)  :: rivsto               ! river storage [m s-1]
+  real,   intent(in)  :: fldsto               ! flood storage [m s-1]
+  real,   intent(in)  :: fldfrc               ! flooded fraction [-]
+ 
   real,   intent(out) :: sfcheadrt            ! extra output for WRF-HYDRO [m] 
 
   ! external function

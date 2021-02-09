@@ -300,15 +300,9 @@ subroutine NoahMP36_main(n)
     real                 :: layersd
 
     !ag (12Sep2019)
-    real                 :: tmp_rivsto         !     MNB ADD LATER
-    real                 :: tmp_fldsto         !     MNB ADD LATER
-    real                 :: tmp_fldfrc         !     MNB ADD LATER
-
-    !ag (18Sep2019)
-    real,   allocatable   :: rivsto(:)
-    real,   allocatable   :: fldsto(:)
-    real,   allocatable   :: fldfrc(:)
-    real,   allocatable   :: tmp_nensem(:,:,:)
+    real                 :: tmp_rivsto        
+    real                 :: tmp_fldsto        
+    real                 :: tmp_fldfrc        
 
     integer               :: status
     integer               :: c,r
@@ -818,7 +812,7 @@ subroutine NoahMP36_main(n)
                                   !ag (12Sep2019)
                                   tmp_rivsto            , & ! in   - river storage [m/s] 
                                   tmp_fldsto            , & ! in   - flood storage [m/s]
-                                  tmp_fldfrc            , & ! in   - flood storage [m/s]
+                                  tmp_fldfrc            , & ! in   - flooded fraction [-]
                                   
                                   tmp_sfcheadrt         )   ! out   - extra output for WRF-HYDRO [m]
             
