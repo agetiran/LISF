@@ -40,8 +40,9 @@ contains
     real, intent(in) :: zdrout
     real, intent(in) :: zdrinf
     real, intent(in) :: rivdph
-    real, intent(out) :: zrivsto
-    real, intent(out) :: zdrsto
+    !ag (21Nov2026) Urban network MPI: Both values are read before update.
+    real, intent(inout) :: zrivsto
+    real, intent(inout) :: zdrsto
 
     real :: zdrcapnow
     real :: zdrflwpot

@@ -104,7 +104,6 @@ contains
 
   end subroutine HYMAP3_get_vector_size
   ! ================================================
-!#if 0
   ! ================================================
   subroutine HYMAP3_get_seq(nx, ny, nxg, nyg, offx, offy, nseqall, &
        imis, nextx, nexty, mask, sindex, outlet, seqx, seqy, next)

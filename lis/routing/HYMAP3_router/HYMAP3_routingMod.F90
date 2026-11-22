@@ -36,12 +36,12 @@ module HYMAP3_routingMod
 !   a river flow map.
 ! 07 Sep 2019: Augusto Getirana,  Added support for 2-way coupling
 ! 27 Apr 2020: Augusto Getirana,  Added support for urban drainage
-! 13 Nov 2025: Augusto Getirana,  Added runoff bias correction
 !
 ! !USES:
   use ESMF
   use LIS_constantsMod, only: LIS_CONST_PATH_LEN
   use LIS_topoMod
+  use HYMAP3_netcdf_utilsMod
 
   implicit none
 
@@ -57,11 +57,76 @@ module HYMAP3_routingMod
   public :: HYMAP3_map_g2l
   public :: HYMAP3_map_gxy2l_index
   public :: HYMAP3_map_l2g_index
+  public :: HYMAP3_match_points
+  !ag (21Nov2026) Network MPI: Precomputed river-link communication;
+  ! leave the original gather/map functions above intact for fallback.
+  public :: HYMAP3_network_exchange_downstates
+  public :: HYMAP3_network_accumulate_inflows
+  !ag (21Nov2026) Urban network MPI: Urban drainage sparse exchange.
+  public :: HYMAP3_network_build_urban
+  public :: HYMAP3_network_accumulate_urban
+  !ag (21Nov2026) Network MPI phase 2: Sparse, owner-to-master and
+  ! master-to-owner exchanges only for optional operator grid cells.
+  public :: HYMAP3_network_build_operator_map
+  public :: HYMAP3_network_operator_gather
+  public :: HYMAP3_network_operator_scatter
+
 !-----------------------------------------------------------------------------
 ! !PUBLIC TYPES:
 !-----------------------------------------------------------------------------
 
   public :: HYMAP3_routing_struc
+
+  !ag (21Nov2026) Network MPI: Communication plan is independent of
+  ! rectangular processor boundaries. Each cross-rank river link is an
+  ! upstream -> downstream edge; the same edge transports downstream
+  ! hydraulic states in reverse and upstream discharge contributions forward.
+  type :: HYMAP3_network_mpi_dec
+     integer :: nout = 0   ! local upstream -> remote downstream edges
+     integer :: nin  = 0   ! remote upstream -> local downstream edges
+     integer, allocatable :: owner(:)            ! global river index -> MPI rank (0-based)
+     integer, allocatable :: gl2local(:)         ! global river index -> index on owner
+     integer, allocatable :: local2gl(:)         ! local river index -> global index
+     integer, allocatable :: out_count(:), in_count(:) ! 0:LIS_npes-1
+     integer, allocatable :: out_off(:), in_off(:)     ! 0:LIS_npes
+     integer, allocatable :: out_src_local(:)   ! per-peer order, sorted by global source
+     integer, allocatable :: in_dst_local(:)    ! per-peer order, sorted by global source
+     integer, allocatable :: in_src_global(:)   ! per-peer order, sorted by global source
+     integer, allocatable :: remote_down_slot(:)! local upstream cell -> halo slot (0 if local)
+     integer, allocatable :: remote_up_slot(:)  ! global upstream -> remote flux slot
+     !ag (22Nov2026) MPI performance: Peers and reusable workspace are constructed
+     ! ONCE at initialization; preserve original per-peer message ordering.
+     integer, allocatable :: out_peer(:),in_peer(:)
+     real, allocatable :: state_sendbuf(:,:),flux_sendbuf(:,:),flux_recvbuf(:,:)
+     ! Preserve the frozen previous-depth history and downstream halo from
+     ! numerical-parity fix; only workspace lifetime changes, not equations.
+     real, allocatable :: depth_old_riv(:),depth_old_fld(:),down_halo(:,:)
+     integer, allocatable :: up_ptr(:)          ! CSR: local downstream -> upstream IDs
+     integer, allocatable :: up_global(:)       ! sorted by global source within each dest
+     !ag (21Nov2026) Network MPI phase 2: Ownership-sorted unique cells
+     ! touched by reservoirs, bifurcations, management, or gauge insertion.
+     ! Prepared once, reused across every routing substep.
+     integer :: noperator = 0
+     integer, allocatable :: op_gid(:)
+     integer, allocatable :: op_count(:) ! 0:LIS_npes-1
+     integer, allocatable :: op_off(:)   ! 0:LIS_npes
+     !ag (21Nov2026) Urban network MPI: Dedicated urban-drainage graph.
+     ! Urban transport includes EVERY valid NEXT_GLB edge, whereas the
+     ! standard river graph excludes outlet cells. Independent adjacency
+     ! avoids changing the validated river-routing accumulation sequence.
+     integer :: urban_nout = 0, urban_nin = 0
+     integer, allocatable :: urban_out_count(:),urban_in_count(:)
+     integer, allocatable :: urban_out_off(:),urban_in_off(:)
+     integer, allocatable :: urban_out_src_local(:)
+     integer, allocatable :: urban_in_src_global(:)
+     integer, allocatable :: urban_remote_up_slot(:)
+     integer, allocatable :: urban_up_ptr(:),urban_up_global(:)
+     !ag (22Nov2026) MPI performance: Urban peers/workspace, persistent per nest.
+     integer, allocatable :: urban_out_peer(:),urban_in_peer(:)
+     real, allocatable :: urban_sendbuf(:),urban_recvbuf(:)
+     logical :: urban_initialized = .false.
+     logical :: initialized = .false.
+  end type HYMAP3_network_mpi_dec
 
   type, public :: HYMAP3_routing_dec
 
@@ -84,6 +149,11 @@ module HYMAP3_routingMod
      integer, allocatable :: outlet_glb(:)       !outlet flag: 0 - river; 1 - ocean
      integer, allocatable :: next(:)        !downstream grid cell
      integer, allocatable :: next_glb(:)        !downstream grid cell
+     !ag (22Nov2026) Network MPI: Optimized grid-cell link communication
+     ! is enabled by default. Set option 0 explicitly to retain the
+     ! original full-domain gather/broadcast implementation.
+     integer :: network_mpi_flag = 1
+     type(HYMAP3_network_mpi_dec) :: network
      integer, allocatable :: nextx(:,:)
      integer, allocatable :: nexty(:,:)
      real,    allocatable :: elevtn(:)      !grid elevation [m]
@@ -135,12 +205,12 @@ module HYMAP3_routingMod
      real                 :: rstInterval
      character*20         :: startMode
      integer              :: mo
-
+     !ag (04Jun2012)
      integer              :: flowtype     !flow type flag
      integer              :: linresflag   !linear reservoir (time delay) flag
      integer              :: evapflag     !evaporation from open water flag
 
-
+     !ag (03May2017)
      real,   allocatable  :: ewat(:,:)     !potential evaporation from open waters [km m-2 s-1]
      real,   allocatable  :: edif(:,:) !differential evapotranspiration
                                        ! (evaporation from open waters -
@@ -148,7 +218,7 @@ module HYMAP3_routingMod
                                        ! as input in HyMAP [km m-2 s-1]
 
      integer              :: dwiflag      !deep water infiltration flag
-
+     !ag (11Sep2015)
      integer              :: steptype     !time step type flag
 
      character(LIS_CONST_PATH_LEN) :: LISdir     !if LIS output is being read
@@ -164,7 +234,7 @@ module HYMAP3_routingMod
 
      real,    allocatable  :: dtaout(:,:)
 
-
+     !ag (30Jan2016)
      ! === timer variables ====================
      real                 :: dt_proc
 
@@ -182,12 +252,12 @@ module HYMAP3_routingMod
      integer              :: resopflag
      character(LIS_CONST_PATH_LEN) :: resopdir
      character(LIS_CONST_PATH_LEN) :: resopheader
-
+     !ag (29Jun2016)
      integer              :: floodflag
      character(LIS_CONST_PATH_LEN) :: HYMAP_dfile
-
+     !ag(17Apr2024)
      integer, allocatable :: resoptype(:)
-
+     !ag(11Oct2024)
      real,   allocatable  :: elevtn_resop(:)
      real,   allocatable  :: fldhgt_resop(:,:)
      real,   allocatable  :: fldstomax_resop(:,:)
@@ -203,7 +273,7 @@ module HYMAP3_routingMod
      integer              :: enable2waycpl
      real                 :: fldfrc2waycpl
 
-
+     !ag(27Apr2020)
      ! === urban drainage and flood modeling ===
      real,   allocatable  :: drsto(:,:)      !urban drainage network water storage [m3]
      real,   allocatable  :: drout(:,:)      !urban drainage network outflow [m3/s]
@@ -226,7 +296,7 @@ module HYMAP3_routingMod
      real                        :: drman   ! Roughness coefficient for ciment pipes [-]
      real                        :: drslp      ! drainage system slope [m/m]
 
-
+     !ag(8Aug2020)
      ! === direct streamflow insertion variables/parameters ===
      integer, allocatable :: insertloc(:)
      real*8,  allocatable :: tinsert(:,:)
@@ -237,7 +307,7 @@ module HYMAP3_routingMod
      character(LIS_CONST_PATH_LEN) :: insertdir
      character(LIS_CONST_PATH_LEN) :: insertheader
 
-
+     !ag(30Mar2021)
      ! === sea level variables/parameters ===
      integer, allocatable  :: outletid(:)      !outlet identification
      real*8,  allocatable  :: tsealevel(:,:)   !date/time for sea level time series
@@ -250,7 +320,7 @@ module HYMAP3_routingMod
      character(LIS_CONST_PATH_LEN) :: sealeveldir      !directory containing files with sea level time series
      character(LIS_CONST_PATH_LEN) :: sealevelheader   !file containing list of sea level time series
      character(LIS_CONST_PATH_LEN) :: outletlist       !file containing list of outlet under varying sea level effect
-
+     !ag
      ! === water management variables/parameters ===
      integer, allocatable  :: managact(:)
      integer, allocatable  :: managloc(:,:)
@@ -261,7 +331,7 @@ module HYMAP3_routingMod
      integer               :: nmanag            !number of locations with water management
      integer               :: managflag
      character(LIS_CONST_PATH_LEN) :: managheader
-
+     !ag(30Mar2022)
      ! === bifurcation variables/parameters ===
      integer               :: bifflag          !bifurcation flag
      character(LIS_CONST_PATH_LEN) :: biffile          !bifurcation pathway input file
@@ -277,6 +347,7 @@ module HYMAP3_routingMod
      real,    allocatable  :: bifsto(:,:)      !bifurcation water storage for each elevation [m3]
      integer, allocatable  :: bifloc(:,:)      !location of upstream and downstream grids composing bifurcation
 
+     !ag(23Feb2023)
      ! === levee variables/parameters ===
      integer               :: levflag          !levee flag
      real,    allocatable  :: levhgt(:)        !levee elevation above surface elevation [m]
@@ -284,13 +355,14 @@ module HYMAP3_routingMod
      real,    allocatable  :: fldonlystomax(:,:,:) !maximum floodplain-only storage - excludes river storage [m3]
      real,    allocatable  :: fldstoatlev(:,:) !isolated floodplain storage at levee elevation - excludes river storage [m3]
 
+     !ag(8Nov2024)
      ! === slope constraints ===
      real,    allocatable  :: rivslp(:)        !riverbed slope [m/m]
      real,    allocatable  :: maxsfcslp(:)     !upper threshold (max. allowed) surface slope [m/m]
 
+     !ag(4Apr2025)
      ! === Yassin's reservoir operation scheme ===
      character(LIS_CONST_PATH_LEN) :: resopncfile
-     integer,  allocatable :: ncloc_resop(:)
      real*8,   allocatable :: maxsto_resop(:)
      real*8,   allocatable :: inidis_resop(:)
      real*8,   allocatable :: inisto_resop(:)
@@ -304,14 +376,17 @@ module HYMAP3_routingMod
      real*8,   allocatable :: nupdis_mo_resop(:,:)
      real*8,   allocatable :: uppdis_mo_resop(:,:)
 
-     real*8,   allocatable :: reg1_resop(:)
-     real*8,   allocatable :: reg2_resop(:)
-     real*8,   allocatable :: reg3_resop(:)
+     integer,  allocatable :: ncurve_resop(:)
+     real*8,   allocatable :: elev_curve_resop(:,:)
+     real*8,   allocatable :: vol_curve_resop(:,:)
+     integer               :: ncurve_max_resop
 
+     !ag(14Apr2025)
      ! === vector-based HyMAP implementation ===
      character(LIS_CONST_PATH_LEN) :: vecfile  !vector input file
      integer               :: vecflag          !vector input flag
 
+     !ag(4Apr2025)
      ! ===== runoff bias correction =====
      integer              :: rbiasflag       !total runoff bias correction flag
      real,    allocatable :: rbias_ratio(:)  !total runoff bias correction factor [-]
@@ -330,10 +405,13 @@ contains
 !
   subroutine HYMAP3_routingInit
     !USES:
+    !ag(6Apr2022)
     use HYMAP3_bifMod
     use HYMAP3_initMod
+    !ag(1May2021)
     use HYMAP3_managMod
     use HYMAP3_modelMod
+    !ag(27Apr2020)
     use HYMAP3_urbanMod
     use LIS_coreMod
     use LIS_logMod
@@ -341,6 +419,7 @@ contains
     use LIS_perturbMod
     use LIS_routingMod
     use LIS_timeMgrMod
+    use HYMAP3_netcdf_utilsMod
 
     implicit none
 
@@ -358,17 +437,27 @@ contains
     character*100        :: ctitle
     character*10         :: time
     character*20         :: flowtype
+    !ag (11Sep2015)
     character*20         :: steptype
 
+    integer              :: floodflag
+    integer              :: linresflag
+    integer              :: evapflag
+    integer              :: dwiflag
+
+    !ag (19Feb2016)
     real,    allocatable :: tmp_real(:,:),tmp_real_nz(:,:,:)
     integer, allocatable :: mask(:,:),maskg(:,:)
-    real,    allocatable :: elevtn(:,:),uparea(:,:),basin(:,:)
+    real,    allocatable :: elevtn(:,:)
 
+    !ag (11Mar2016)
     integer, external  :: LIS_create_subdirs
 
+    !ag (03Apr2017)
     integer       :: m
     integer       :: gdeltas
 
+    !ag (12Sep2019)
     type(ESMF_Field)     :: rivsto_field
     type(ESMF_Field)     :: fldsto_field
     type(ESMF_Field)     :: fldfrc_field
@@ -400,6 +489,7 @@ contains
     character*20         :: alglist(10)
     logical              :: Routing_DAvalid
 
+    !ag(7Sep2022)
     ! === bifurcation local variables/parameters ===
     real,    allocatable :: elevtn_glb(:)      !river bed elevation [m]
     real,    allocatable :: grarea_glb(:)      !area of the grid [m^2]
@@ -409,15 +499,45 @@ contains
     real,    allocatable :: rivlen_glb(:)      !river length [m]
     real,    allocatable :: rivwth_glb(:)      !river width [m]
     real,    allocatable :: rivelv_glb(:)      !elevation of river bed [m]
+    real,    allocatable :: rivsto_glb(:)      !river storage [m3]
+    real,    allocatable :: fldsto_glb(:)      !floodplain storage [m3]
     real*8               :: bifelv1,bifsto1
-    integer              :: ibif,ielv,icg,iz
+    integer              :: ibif,ielv,ic,icg,iz
+    real*8               :: zelv
+    !ag(11Oct2024)
 
     integer              :: iresop
     real                 :: cadp
 
+    integer              :: ngres, icg_down, ix, iy, l
+    integer              :: ncloc_resop
+    integer, allocatable :: id_resop(:)
+    integer, allocatable :: id_global_resop(:)
+    logical              :: resop_found,flag_x,flag_y
+
+    !ag(25Jan2026)
+    real,    allocatable :: node_lon(:),node_lat(:),uparea(:)
+    real,    allocatable :: node_lon_glb(:),node_lat_glb(:)
+    integer, allocatable :: node_x_glb(:),node_y_glb(:),resop_mask_glb(:)
+    real*8,  allocatable :: resop_lon(:),resop_lat(:),resop_uparea(:)
+    integer, allocatable :: resop_id_tmp(:), node_id_tmp(:)
+
+    !ag(18Jun2026)
+    integer, allocatable :: resop_x(:),resop_y(:)
+
+    !ag(3Jul2026)
+    real,    allocatable :: uparea_glb(:)      !drainage area  [m^2]
+
     external :: initrunoffdata
     external :: perturbinit
     external :: perturbsetup
+
+#if (defined SPMD)
+    external :: MPI_ALLREDUCE
+    external :: MPI_ALLGATHER
+    external :: MPI_BCAST
+    external :: MPI_ALLGATHERV
+#endif
 
     allocate(HYMAP3_routing_struc(LIS_rc%nnest))
 
@@ -433,6 +553,29 @@ contains
        HYMAP3_routing_struc(n)%dt_proc  = 0.
     enddo
 
+    !ag (22Nov2026) Network MPI: Default to the optimized communication.
+    ! lis.config can explicitly specify 0 for the legacy fallback or 1
+    ! for the optimized implementation. The vector-input exclusion remains.
+    do n=1,LIS_rc%nnest
+       HYMAP3_routing_struc(n)%network_mpi_flag = 1
+    enddo
+    call ESMF_ConfigFindLabel(LIS_config, &
+         "HYMAP3 routing network MPI option:",rc=status)
+    if(status==0)then
+       do n=1,LIS_rc%nnest
+          call ESMF_ConfigGetAttribute(LIS_config, &
+               HYMAP3_routing_struc(n)%network_mpi_flag,rc=status)
+          call LIS_verify(status, &
+               "HYMAP3 routing network MPI option: invalid value")
+          if(HYMAP3_routing_struc(n)%network_mpi_flag/=0.and. &
+               HYMAP3_routing_struc(n)%network_mpi_flag/=1)then
+             write(LIS_logunit,*)'[ERR] HYMAP3 network MPI option must be 0 or 1'
+             call LIS_endrun()
+          endif
+       enddo
+    endif
+
+    !ag(14Apr2025)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 vector input file:",rc=status)
     do n=1, LIS_rc%nnest
@@ -455,6 +598,7 @@ contains
        endif
     enddo
 
+    !ag (12Sep2019)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 enable 2-way coupling:",rc=status)
     do n=1, LIS_rc%nnest
@@ -510,6 +654,7 @@ contains
 
     !Local inertia is the default routing method
     flowtype="local inertia"
+    !ag (13Apr2016)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 routing method:",rc=status)
     if(status==0)call ESMF_ConfigGetAttribute(LIS_config,&
@@ -523,6 +668,7 @@ contains
           HYMAP3_routing_struc(n)%flowtype = 3
        elseif(flowtype.eq."hybrid") then
           HYMAP3_routing_struc(n)%flowtype = 0
+          !ag(27Apr2020)
        elseif(flowtype.eq."urban") then
           HYMAP3_routing_struc(n)%flowtype = 4
        else
@@ -536,6 +682,7 @@ contains
 
     !adaptive is the default time step method
     steptype="adaptive"
+    !ag (11Sep2015)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 routing model time step method:",rc=status)
     if(status==0)call ESMF_ConfigGetAttribute(LIS_config,&
@@ -571,40 +718,46 @@ contains
        enddo
     endif
 
+    floodflag=1
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 floodplain dynamics:",rc=status)
+    if(status==0)call ESMF_ConfigGetAttribute(LIS_config,&
+         floodflag,rc=status)
     do n=1, LIS_rc%nnest
-       !"1" is the default floodplain dynamics flag, i.e., "on"
-       HYMAP3_routing_struc(n)%floodflag=1
-       call ESMF_ConfigGetAttribute(LIS_config,&
-            HYMAP3_routing_struc(n)%floodflag,rc=status)
+       HYMAP3_routing_struc(n)%floodflag=floodflag
+       write(LIS_logunit,*)"[INFO] HYMAP3 flood dynamics flag: ", &
+            HYMAP3_routing_struc(n)%floodflag
     enddo
 
+    linresflag=0
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 routing model linear reservoir flag:",rc=status)
+    if(status==0)call ESMF_ConfigGetAttribute(LIS_config,&
+         linresflag,rc=status)
     do n=1, LIS_rc%nnest
-       !"0" is the default linear reservoir flag, i.e., "off"
-       HYMAP3_routing_struc(n)%linresflag=0
-       call ESMF_ConfigGetAttribute(LIS_config,&
-            HYMAP3_routing_struc(n)%linresflag,rc=status)
+       HYMAP3_routing_struc(n)%linresflag=linresflag
+       write(LIS_logunit,*)"[INFO] HYMAP3 linear reservoir flag: ", &
+            HYMAP3_routing_struc(n)%linresflag
     enddo
 
-    !"none" is the default evaporation option, i.e., "off"
+    evapflag=0
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 routing model evaporation option",rc=status)
+    if(status==0)call ESMF_ConfigGetAttribute(LIS_config,&
+         evapflag,rc=status)
     do n=1, LIS_rc%nnest
-       HYMAP3_routing_struc(n)%evapflag=0
-       call ESMF_ConfigGetAttribute(LIS_config,&
-            HYMAP3_routing_struc(n)%evapflag,rc=status)
+       HYMAP3_routing_struc(n)%evapflag=evapflag
+       write(LIS_logunit,*)"[INFO] HYMAP3 evap flag: ", &
+            HYMAP3_routing_struc(n)%evapflag
     enddo
 
+    dwiflag=0
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 routing model dwi flag:",rc=status)
+    if(status==0)call ESMF_ConfigGetAttribute(LIS_config,&
+         dwiflag,rc=status)
     do n=1, LIS_rc%nnest
-       !"0" is the default linear dwi flag, i.e., "off"
-       HYMAP3_routing_struc(n)%dwiflag=0
-       call ESMF_ConfigGetAttribute(LIS_config,&
-            HYMAP3_routing_struc(n)%dwiflag,rc=status)
+       HYMAP3_routing_struc(n)%dwiflag=dwiflag
        write(LIS_logunit,*)"[INFO] HYMAP3 dwi flag: ", &
             HYMAP3_routing_struc(n)%dwiflag
     enddo
@@ -618,6 +771,7 @@ contains
        endif
     enddo
 
+    !ag (8Aug2020)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 discharge direct insertion:",rc=status)
     do n=1, LIS_rc%nnest
@@ -658,6 +812,7 @@ contains
        endif
     enddo
 
+    !ag (30Apr2021)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 water management:",rc=status)
     do n=1, LIS_rc%nnest
@@ -674,6 +829,7 @@ contains
        endif
     enddo
 
+    !ag (30Mar2021)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 sea level:",rc=status)
     do n=1, LIS_rc%nnest
@@ -725,6 +881,7 @@ contains
        endif
     enddo
 
+    !ag(30Mar2022)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 river bifurcation:",rc=status)
     do n=1, LIS_rc%nnest
@@ -738,6 +895,7 @@ contains
                HYMAP3_routing_struc(n)%biffile,rc=status)
           call LIS_verify(status,&
                "HYMAP3 river bifurcation pathway file: not defined")
+          !ag(27Jul2025)
           !get number of bifurcations and elevations
           call HYMAP3_read_header_size1(HYMAP3_routing_struc(n)%biffile,&
                HYMAP3_routing_struc(n)%nbif, &
@@ -745,6 +903,7 @@ contains
        endif
     enddo
 
+    !ag(23Feb2023)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 levee:",rc=status)
     do n=1, LIS_rc%nnest
@@ -753,53 +912,8 @@ contains
             HYMAP3_routing_struc(n)%levflag,rc=status)
     enddo
 
-    call ESMF_ConfigFindLabel(LIS_config,&
-         "HYMAP3 reservoir operation option:",rc=status)
-    do n=1, LIS_rc%nnest
-       HYMAP3_routing_struc(n)%resopflag=0
-       call ESMF_ConfigGetAttribute(LIS_config,&
-            HYMAP3_routing_struc(n)%resopflag,default=0,rc=status)
 
-       if(HYMAP3_routing_struc(n)%resopflag==1)then
-
-          call ESMF_ConfigFindLabel(LIS_config,&
-               "HYMAP3 reservoir operation input directory:",rc=status)
-          call ESMF_ConfigGetAttribute(LIS_config,&
-               HYMAP3_routing_struc(n)%resopdir,rc=status)
-          call LIS_verify(status,&
-               "HYMAP3 reservoir operation input directory: not defined")
-
-          call ESMF_ConfigFindLabel(LIS_config,&
-               "HYMAP3 reservoir operation header filename:",rc=status)
-          call ESMF_ConfigGetAttribute(LIS_config,&
-               HYMAP3_routing_struc(n)%resopheader,rc=status)
-          call LIS_verify(status,&
-               "HYMAP3 reservoir operation header filename: not defined")
-          call HYMAP3_read_header_size1( &
-               trim(HYMAP3_routing_struc(n)%resopheader),&
-               HYMAP3_routing_struc(n)%nresop, &
-               HYMAP3_routing_struc(n)%ntresop)
-          !Yassin's scheme
-       elseif(HYMAP3_routing_struc(n)%resopflag==2)then
-          call ESMF_ConfigFindLabel(LIS_config,&
-               "HYMAP3 reservoir operation input file:",rc=status)
-          call ESMF_ConfigGetAttribute(LIS_config,&
-               HYMAP3_routing_struc(n)%resopncfile,rc=status)
-          call LIS_verify(status,&
-               "HYMAP3 reservoir operation input file: not defined")
-
-          call ESMF_ConfigFindLabel(LIS_config,&
-               "HYMAP3 reservoir list:",rc=status)
-          call ESMF_ConfigGetAttribute(LIS_config,&
-               HYMAP3_routing_struc(n)%resopheader,rc=status)
-          call LIS_verify(status,&
-               "HYMAP3 reservoir list: not defined")
-          call HYMAP3_read_header_size( &
-               trim(HYMAP3_routing_struc(n)%resopheader),&
-               HYMAP3_routing_struc(n)%nresop)
-       endif
-    enddo
-
+    !ag (11Nov2025)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 runoff bias correction:",rc=status)
     do n=1, LIS_rc%nnest
@@ -814,10 +928,12 @@ contains
     write(LIS_logunit,*) '[INFO] Initializing HYMAP3....'
     !allocate matrixes
     do n=1, LIS_rc%nnest
+       !ag(14Apr2025)
        if(HYMAP3_routing_struc(n)%vecflag==0)then
           write(LIS_logunit,*)'[INFO] columns and rows', &
                LIS_rc%lnc(n),LIS_rc%lnr(n)
 
+          !ag (19Feb2016)
           allocate(HYMAP3_routing_struc(n)%nextx( &
                LIS_rc%gnc(n),LIS_rc%gnr(n)))
           ctitle = 'HYMAP_flow_direction_x'
@@ -829,18 +945,6 @@ contains
           ctitle = 'HYMAP_flow_direction_y'
           call HYMAP3_read_param_int_2d_global(ctitle,n, &
                HYMAP3_routing_struc(n)%nexty)
-
-          allocate(elevtn(LIS_rc%lnc(n),LIS_rc%lnr(n)))
-          ctitle = 'HYMAP_grid_elevation'
-          call HYMAP3_read_param_real_2d(ctitle,n,elevtn)
-
-          allocate(uparea(LIS_rc%lnc(n),LIS_rc%lnr(n)))
-          ctitle = 'HYMAP_drain_area'
-          call HYMAP3_read_param_real_2d(ctitle,n,uparea)
-
-          allocate(basin(LIS_rc%lnc(n),LIS_rc%lnr(n)))
-          ctitle = 'HYMAP_basin'
-          call HYMAP3_read_param_real_2d(ctitle,n,basin)
 
           allocate(mask(LIS_rc%lnc(n),LIS_rc%lnr(n)))
           ctitle = 'HYMAP_basin_mask'
@@ -986,85 +1090,7 @@ contains
        allocate(HYMAP3_routing_struc(n)%bsfdwi_ratio( &
             HYMAP3_routing_struc(n)%nseqall))
 
-       if(HYMAP3_routing_struc(n)%resopflag==1)then
-          allocate(HYMAP3_routing_struc(n)%resoploc( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%resoploc_dwn( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%resoploc_glb( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%resoploc_dwn_glb( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%resopoutmin( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%tresopalt( &
-               HYMAP3_routing_struc(n)%nresop, &
-               HYMAP3_routing_struc(n)%ntresop))
-          allocate(HYMAP3_routing_struc(n)%resopalt( &
-               HYMAP3_routing_struc(n)%nresop, &
-               HYMAP3_routing_struc(n)%ntresop))
-          allocate(HYMAP3_routing_struc(n)%resoptype( &
-               HYMAP3_routing_struc(n)%nresop))
-
-          allocate(HYMAP3_routing_struc(n)%elevtn_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%fldhgt_resop( &
-               HYMAP3_routing_struc(n)%nresop,HYMAP3_routing_struc(n)%nz))
-          allocate(HYMAP3_routing_struc(n)%fldstomax_resop( &
-               HYMAP3_routing_struc(n)%nresop,HYMAP3_routing_struc(n)%nz))
-          allocate(HYMAP3_routing_struc(n)%grarea_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%rivstomax_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%rivelv_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%rivlen_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%rivwth_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-
-          !Yassin's scheme
-       elseif(HYMAP3_routing_struc(n)%resopflag==2)then
-          allocate(HYMAP3_routing_struc(n)%resoploc( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%resoploc_dwn( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%resoploc_glb( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%resoploc_dwn_glb( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%ncloc_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%maxsto_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%inidis_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%inisto_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%dwndis_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%deadis_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%minsto_mo_resop( &
-               HYMAP3_routing_struc(n)%nresop,12))
-          allocate(HYMAP3_routing_struc(n)%nupsto_mo_resop( &
-               HYMAP3_routing_struc(n)%nresop,12))
-          allocate(HYMAP3_routing_struc(n)%uppsto_mo_resop( &
-               HYMAP3_routing_struc(n)%nresop,12))
-          allocate(HYMAP3_routing_struc(n)%mindis_mo_resop( &
-               HYMAP3_routing_struc(n)%nresop,12))
-          allocate(HYMAP3_routing_struc(n)%nupdis_mo_resop( &
-               HYMAP3_routing_struc(n)%nresop,12))
-          allocate(HYMAP3_routing_struc(n)%uppdis_mo_resop( &
-               HYMAP3_routing_struc(n)%nresop,12))
-          allocate(HYMAP3_routing_struc(n)%reg1_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%reg2_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-          allocate(HYMAP3_routing_struc(n)%reg3_resop( &
-               HYMAP3_routing_struc(n)%nresop))
-       endif
-
+       !ag(27Apr2020)
        allocate(HYMAP3_routing_struc(n)%drstomax( &
             HYMAP3_routing_struc(n)%nseqall))
        allocate(HYMAP3_routing_struc(n)%droutlet( &
@@ -1078,6 +1104,7 @@ contains
        allocate(HYMAP3_routing_struc(n)%drtotlgh( &
             HYMAP3_routing_struc(n)%nseqall))
 
+       !ag(8Aug2020)
        if(HYMAP3_routing_struc(n)%insertflag==1)then
           allocate(HYMAP3_routing_struc(n)%insertloc( &
                HYMAP3_routing_struc(n)%ninsert))
@@ -1089,6 +1116,7 @@ contains
                HYMAP3_routing_struc(n)%ntinsert))
        endif
 
+       !ag(23Feb2023)
        allocate(HYMAP3_routing_struc(n)%levhgt( &
             HYMAP3_routing_struc(n)%nseqall))
 
@@ -1130,6 +1158,7 @@ contains
 
           allocate(HYMAP3_routing_struc(n)%dtaout( &
                HYMAP3_routing_struc(n)%nseqall,1))
+          !ag (19Jan2016)
           allocate(HYMAP3_routing_struc(n)%rivout_pre( &
                HYMAP3_routing_struc(n)%nseqall,1))
           allocate(HYMAP3_routing_struc(n)%rivdph_pre( &
@@ -1140,21 +1169,25 @@ contains
                HYMAP3_routing_struc(n)%nseqall,1))
           allocate(HYMAP3_routing_struc(n)%fldelv1( &
                HYMAP3_routing_struc(n)%nseqall,1))
+          !ag (03May2017)
           allocate(HYMAP3_routing_struc(n)%ewat( &
                HYMAP3_routing_struc(n)%nseqall,1))
           allocate(HYMAP3_routing_struc(n)%edif( &
                HYMAP3_routing_struc(n)%nseqall,1))
+          !ag (12Sep2019)
           allocate(HYMAP3_routing_struc(n)%rivstotmp( &
                HYMAP3_routing_struc(n)%nseqall,1))
           allocate(HYMAP3_routing_struc(n)%fldstotmp( &
                HYMAP3_routing_struc(n)%nseqall,1))
           allocate(HYMAP3_routing_struc(n)%fldfrctmp( &
                HYMAP3_routing_struc(n)%nseqall,1))
+          !ag(27Apr2020)
           allocate(HYMAP3_routing_struc(n)%drsto( &
                HYMAP3_routing_struc(n)%nseqall,1))
           allocate(HYMAP3_routing_struc(n)%drout( &
                HYMAP3_routing_struc(n)%nseqall,1))
 
+          !ag(22May2024)
           allocate(HYMAP3_routing_struc(n)%levstomax( &
                HYMAP3_routing_struc(n)%nseqall,1))
           allocate(HYMAP3_routing_struc(n)%fldstoatlev( &
@@ -1199,6 +1232,7 @@ contains
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
           allocate(HYMAP3_routing_struc(n)%dtaout( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
+          !ag (19Jan2016)
           allocate(HYMAP3_routing_struc(n)%rivout_pre( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
           allocate(HYMAP3_routing_struc(n)%rivdph_pre( &
@@ -1209,20 +1243,24 @@ contains
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
           allocate(HYMAP3_routing_struc(n)%fldelv1( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
+          !ag (03May2017)
           allocate(HYMAP3_routing_struc(n)%ewat( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
           allocate(HYMAP3_routing_struc(n)%edif( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
+          !ag (12Sep2019)
           allocate(HYMAP3_routing_struc(n)%rivstotmp( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
           allocate(HYMAP3_routing_struc(n)%fldstotmp( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
           allocate(HYMAP3_routing_struc(n)%fldfrctmp( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
+          !ag(27Apr2020)
           allocate(HYMAP3_routing_struc(n)%drsto( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
           allocate(HYMAP3_routing_struc(n)%drout( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
+          !ag(22May2024)
           allocate(HYMAP3_routing_struc(n)%levstomax( &
                HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n)))
           allocate(HYMAP3_routing_struc(n)%fldstoatlev( &
@@ -1231,10 +1269,12 @@ contains
                HYMAP3_routing_struc(n)%nseqall,&
                HYMAP3_routing_struc(n)%nz,LIS_rc%nensem(n)))
        endif
+       !ag(9Oct2024)
        allocate(HYMAP3_routing_struc(n)%outletid( &
             HYMAP3_routing_struc(n)%nseqall))
        HYMAP3_routing_struc(n)%outletid=HYMAP3_routing_struc(n)%imis
 
+       !ag(11Nov2025)
        allocate(HYMAP3_routing_struc(n)%rbias_ratio( &
             HYMAP3_routing_struc(n)%nseqall))
 
@@ -1286,52 +1326,22 @@ contains
        HYMAP3_routing_struc(n)%surfws=0.0
        HYMAP3_routing_struc(n)%dtaout=1000000.
 
+       !ag (19Jan2016)
        HYMAP3_routing_struc(n)%rivout_pre=0.0
        HYMAP3_routing_struc(n)%rivdph_pre=0.0
        HYMAP3_routing_struc(n)%fldout_pre=0.0
        HYMAP3_routing_struc(n)%flddph_pre=0.0
        HYMAP3_routing_struc(n)%fldelv1=0.0
 
-       if(HYMAP3_routing_struc(n)%resopflag==1)then
-          HYMAP3_routing_struc(n)%resoploc = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%resoploc_dwn = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%resoploc_glb = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%resoploc_dwn_glb = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%resopoutmin = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%tresopalt = &
-               dble(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%resopalt = &
-               real(HYMAP3_routing_struc(n)%imis)
-
-          HYMAP3_routing_struc(n)%elevtn_resop = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%fldhgt_resop = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%fldstomax_resop = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%grarea_resop = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%rivstomax_resop = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%rivelv_resop = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%rivlen_resop = &
-               real(HYMAP3_routing_struc(n)%imis)
-          HYMAP3_routing_struc(n)%rivwth_resop = &
-               real(HYMAP3_routing_struc(n)%imis)
-       endif
-
+       !ag (03May2017)
        HYMAP3_routing_struc(n)%ewat=0.0
        HYMAP3_routing_struc(n)%edif=0.0
 
+       !ag(27Apr2020)
        HYMAP3_routing_struc(n)%drsto=0.0
        HYMAP3_routing_struc(n)%drout=0.0
 
+       !ag(8Aug2020)
        if(HYMAP3_routing_struc(n)%insertflag==1)then
           HYMAP3_routing_struc(n)%insertloc = &
                real(HYMAP3_routing_struc(n)%imis)
@@ -1341,12 +1351,14 @@ contains
                real(HYMAP3_routing_struc(n)%imis)
        endif
 
+       !ag(22May2024)
        HYMAP3_routing_struc(n)%levstomax=0.0
        HYMAP3_routing_struc(n)%fldstoatlev=0.0
        HYMAP3_routing_struc(n)%fldonlystomax=0.0
     enddo
 
     do n=1, LIS_rc%nnest
+       !ag(15May2025)
        !read grid-based input parameters
        if(HYMAP3_routing_struc(n)%vecflag==0)then
           write(LIS_logunit,*) '[INFO] Get HYMAP3 cell vector sequence'
@@ -1512,44 +1524,48 @@ contains
                HYMAP3_routing_struc(n)%seqy,&
                tmp_real,HYMAP3_routing_struc(n)%grarea)
 
-          ctitle = 'HYMAP_runoff_time_delay'
-          call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
-          call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),&
-               1,HYMAP3_routing_struc(n)%nseqall,&
-               HYMAP3_routing_struc(n)%imis,&
-               HYMAP3_routing_struc(n)%seqx,&
-               HYMAP3_routing_struc(n)%seqy,&
-               tmp_real,HYMAP3_routing_struc(n)%cntime)
-          where(HYMAP3_routing_struc(n)%cntime==0) &
-               HYMAP3_routing_struc(n)%cntime = &
-               minval(HYMAP3_routing_struc(n)%cntime, &
-               HYMAP3_routing_struc(n)%cntime>0)
+          !ag(30Dec2025)
+          if(HYMAP3_routing_struc(n)%linresflag==1)then
+            ctitle = 'HYMAP_runoff_time_delay'
+            call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
+            call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),&
+                 1,HYMAP3_routing_struc(n)%nseqall,&
+                 HYMAP3_routing_struc(n)%imis,&
+                 HYMAP3_routing_struc(n)%seqx,&
+                 HYMAP3_routing_struc(n)%seqy,&
+                 tmp_real,HYMAP3_routing_struc(n)%cntime)
+            where(HYMAP3_routing_struc(n)%cntime==0) &
+                 HYMAP3_routing_struc(n)%cntime = &
+                 minval(HYMAP3_routing_struc(n)%cntime, &
+                 HYMAP3_routing_struc(n)%cntime>0)
 
-          ctitle = 'HYMAP_runoff_time_delay_multiplier'
-          call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
-          call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),&
-               1,HYMAP3_routing_struc(n)%nseqall,&
-               HYMAP3_routing_struc(n)%imis,&
-               HYMAP3_routing_struc(n)%seqx,&
-               HYMAP3_routing_struc(n)%seqy,&
-               tmp_real,HYMAP3_routing_struc(n)%trnoff)
+            ctitle = 'HYMAP_runoff_time_delay_multiplier'
+            call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
+            call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),&
+                 1,HYMAP3_routing_struc(n)%nseqall,&
+                 HYMAP3_routing_struc(n)%imis,&
+                 HYMAP3_routing_struc(n)%seqx,&
+                 HYMAP3_routing_struc(n)%seqy,&
+                 tmp_real,HYMAP3_routing_struc(n)%trnoff)
 
-          ctitle = 'HYMAP_baseflow_time_delay'
-          call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
-          call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),&
-               1,HYMAP3_routing_struc(n)%nseqall,&
-               HYMAP3_routing_struc(n)%imis,&
-               HYMAP3_routing_struc(n)%seqx,&
-               HYMAP3_routing_struc(n)%seqy,&
-               tmp_real,HYMAP3_routing_struc(n)%tbsflw)
-          write(LIS_logunit,*) &
-               '[INFO] Remove zeros from groundwater time delay'
-          where(HYMAP3_routing_struc(n)%tbsflw < &
-               HYMAP3_routing_struc(n)%cntime/86400..and.&
-               HYMAP3_routing_struc(n)%cntime>0) &
-               HYMAP3_routing_struc(n)%tbsflw = &
-               HYMAP3_routing_struc(n)%cntime/86400.
+            ctitle = 'HYMAP_baseflow_time_delay'
+            call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
+            call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),&
+                 1,HYMAP3_routing_struc(n)%nseqall,&
+                 HYMAP3_routing_struc(n)%imis,&
+                 HYMAP3_routing_struc(n)%seqx,&
+                 HYMAP3_routing_struc(n)%seqy,&
+                 tmp_real,HYMAP3_routing_struc(n)%tbsflw)
+            write(LIS_logunit,*) &
+                 '[INFO] Remove zeros from groundwater time delay'
+            where(HYMAP3_routing_struc(n)%tbsflw < &
+                 HYMAP3_routing_struc(n)%cntime/86400..and.&
+                 HYMAP3_routing_struc(n)%cntime>0) &
+                 HYMAP3_routing_struc(n)%tbsflw = &
+                 HYMAP3_routing_struc(n)%cntime/86400.
+          endif
 
+         !ag (23Nov2016)
           ctitle = 'HYMAP_runoff_dwi_ratio'
           if(HYMAP3_routing_struc(n)%dwiflag==1)then
              call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
@@ -1563,6 +1579,7 @@ contains
              HYMAP3_routing_struc(n)%rnfdwi_ratio=0.
           endif
 
+          !ag (23Nov2016)
           ctitle = 'HYMAP_baseflow_dwi_ratio'
           if(HYMAP3_routing_struc(n)%dwiflag==1)then
              call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
@@ -1576,7 +1593,9 @@ contains
              HYMAP3_routing_struc(n)%bsfdwi_ratio=0.
           endif
 
+          !ag (13Apr2016)
           ctitle = 'HYMAP_river_flow_type'
+          !ag(27Apr2020)
           if(HYMAP3_routing_struc(n)%flowtype==0 .or. &
                HYMAP3_routing_struc(n)%flowtype==4)then
              call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
@@ -1591,6 +1610,7 @@ contains
                   HYMAP3_routing_struc(n)%flowtype
           endif
 
+          !ag (7Dec2020)
           ctitle = 'HYMAP_urban_drainage_outlet'
           if(HYMAP3_routing_struc(n)%flowtype==4)then
              call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
@@ -1605,6 +1625,7 @@ contains
                   HYMAP3_routing_struc(n)%imis
           endif
 
+          !ag(23Feb2023)
           ctitle = 'HYMAP_levee_height'
           if(HYMAP3_routing_struc(n)%levflag==1)then
              call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
@@ -1618,6 +1639,7 @@ contains
              HYMAP3_routing_struc(n)%levhgt=0.0
           endif
 
+          !ag(11Nov2025)
           ctitle = 'HYMAP_runoff_bias_correction'
           if(HYMAP3_routing_struc(n)%rbiasflag==1)then
              call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
@@ -1632,13 +1654,18 @@ contains
           endif
 
 #if (defined SPMD)
+          !ag (21Nov2026) Urban network MPI:
           call MPI_ALLGATHERV(HYMAP3_routing_struc(n)%droutlet,&
-               LIS_rc%nroutinggrid(n),MPI_INTEGER,&
+               LIS_rc%nroutinggrid(n),MPI_REAL,&
                HYMAP3_routing_struc(n)%droutlet_glb,&
                LIS_routing_gdeltas(n,:),&
                LIS_routing_goffsets(n,:),&
-               MPI_INTEGER,&
+               MPI_REAL,&
                LIS_mpi_comm,status)
+#else
+          !ag (21Nov2026) Urban network MPI: Serial global identity map.
+          HYMAP3_routing_struc(n)%droutlet_glb = &
+               HYMAP3_routing_struc(n)%droutlet
 #endif
           deallocate(tmp_real)
           deallocate(tmp_real_nz)
@@ -1784,20 +1811,18 @@ contains
           else
              HYMAP3_routing_struc(n)%levhgt=0.
           endif
-                  
+
           if(HYMAP3_routing_struc(n)%rbiasflag==1)then
              ctitle = 'HYMAP_runoff_bias_correction'
              call HYMAP3_vector_read_param(ctitle,n,1, &
                   HYMAP3_routing_struc(n)%rbias_ratio)
-          else 
+          else
              HYMAP3_routing_struc(n)%rbias_ratio=0.
           endif
-
-
        endif
     enddo
 
-    ! Correction for cases where parameter maps don't match
+    !ag (20Sep2016) Correction for cases where parameter maps don't match
     do n=1, LIS_rc%nnest
        if(HYMAP3_routing_struc(n)%useens.eq.0) then
           do i=1,HYMAP3_routing_struc(n)%nseqall
@@ -1914,88 +1939,106 @@ contains
        endif
     enddo
 
-    write(LIS_logunit,*) '[INFO] Processing data before running HYMAP'
+
+    !ag (4Feb2016)
+    call ESMF_ConfigFindLabel(LIS_config,&
+         "HYMAP3 reservoir operation option:",rc=status)
     do n=1, LIS_rc%nnest
-       write(LIS_logunit,*)'[INFO] Calculate maximum river storage'
+       HYMAP3_routing_struc(n)%resopflag=0
+       call ESMF_ConfigGetAttribute(LIS_config,&
+            HYMAP3_routing_struc(n)%resopflag,default=0,rc=status)
 
-       if(HYMAP3_routing_struc(n)%useens.eq.0) then
-          do i=1,HYMAP3_routing_struc(n)%nseqall
-             HYMAP3_routing_struc(n)%rivstomax(i,1) = &
-                  HYMAP3_routing_struc(n)%rivlen(i) * &
-                  HYMAP3_routing_struc(n)%rivwth(i,1) * &
-                  HYMAP3_routing_struc(n)%rivhgt(i,1)
-             HYMAP3_routing_struc(n)%levstomax(i,1) = &
-                  HYMAP3_routing_struc(n)%rivlen(i) * &
-                  HYMAP3_routing_struc(n)%rivwth(i,1) * &
-                  HYMAP3_routing_struc(n)%levhgt(i)
-             HYMAP3_routing_struc(n)%rivelv(i) = &
-                  HYMAP3_routing_struc(n)%elevtn(i) - &
-                  HYMAP3_routing_struc(n)%rivhgt(i,1)
-             if(HYMAP3_routing_struc(n)%rivwth(i,1)>0) then
-                HYMAP3_routing_struc(n)%rivare(i,1) = &
-                     min(HYMAP3_routing_struc(n)%grarea(i), &
-                     HYMAP3_routing_struc(n)%rivlen(i) * &
-                     HYMAP3_routing_struc(n)%rivwth(i,1))
-             endif
-          enddo
-
-          call HYMAP3_set_fldstg(HYMAP3_routing_struc(n)%nz,&
-               HYMAP3_routing_struc(n)%nseqall,&
-               HYMAP3_routing_struc(n)%fldhgt,&
-               HYMAP3_routing_struc(n)%grarea,&
-               HYMAP3_routing_struc(n)%rivlen,&
-               HYMAP3_routing_struc(n)%rivwth(:,1),&
-               HYMAP3_routing_struc(n)%rivstomax(:,1),&
-               HYMAP3_routing_struc(n)%levhgt,&
-               HYMAP3_routing_struc(n)%fldstomax(:,:,1),&
-               HYMAP3_routing_struc(n)%fldgrd(:,:,1),&
-               HYMAP3_routing_struc(n)%rivare(:,1),&
-               HYMAP3_routing_struc(n)%fldonlystomax(:,:,1),&
-               HYMAP3_routing_struc(n)%fldstoatlev(:,1))
-       else
-          do i=1,HYMAP3_routing_struc(n)%nseqall
-             do m=1,LIS_rc%nensem(n)
-                HYMAP3_routing_struc(n)%rivstomax(i,m) = &
-                     HYMAP3_routing_struc(n)%rivlen(i) * &
-                     HYMAP3_routing_struc(n)%rivwth(i,m) * &
-                     HYMAP3_routing_struc(n)%rivhgt(i,m)
-                HYMAP3_routing_struc(n)%levstomax(i,m) = &
-                     HYMAP3_routing_struc(n)%rivlen(i) * &
-                     HYMAP3_routing_struc(n)%rivwth(i,m) * &
-                     HYMAP3_routing_struc(n)%levhgt(i)
-                HYMAP3_routing_struc(n)%rivelv(i) = &
-                     HYMAP3_routing_struc(n)%elevtn(i) - &
-                     HYMAP3_routing_struc(n)%rivhgt(i,m)
-                if(HYMAP3_routing_struc(n)%rivwth(i,m)>0) then
-                   HYMAP3_routing_struc(n)%rivare(i,m) = &
-                        min(HYMAP3_routing_struc(n)%grarea(i), &
-                        HYMAP3_routing_struc(n)%rivlen(i) * &
-                        HYMAP3_routing_struc(n)%rivwth(i,m))
-                endif
-             enddo
-          enddo
-
-          do m=1,LIS_rc%nensem(n)
-             call HYMAP3_set_fldstg(HYMAP3_routing_struc(n)%nz,&
-                  HYMAP3_routing_struc(n)%nseqall,&
-                  HYMAP3_routing_struc(n)%fldhgt,&
-                  HYMAP3_routing_struc(n)%grarea,&
-                  HYMAP3_routing_struc(n)%rivlen,&
-                  HYMAP3_routing_struc(n)%rivwth(:,m),&
-                  HYMAP3_routing_struc(n)%rivstomax(:,m),&
-                  HYMAP3_routing_struc(n)%levhgt,&
-                  HYMAP3_routing_struc(n)%fldstomax(:,:,m),&
-                  HYMAP3_routing_struc(n)%fldgrd(:,:,m),&
-                  HYMAP3_routing_struc(n)%rivare(:,m),&
-                  HYMAP3_routing_struc(n)%fldstoatlev(:,m),&
-                  HYMAP3_routing_struc(n)%fldonlystomax(:,:,m))
-          enddo
-       endif
-    enddo
-
-    ! read reservoir operation data
-    do n=1, LIS_rc%nnest
        if(HYMAP3_routing_struc(n)%resopflag==1)then
+
+          call ESMF_ConfigFindLabel(LIS_config,&
+               "HYMAP3 reservoir operation input directory:",rc=status)
+          call ESMF_ConfigGetAttribute(LIS_config,&
+               HYMAP3_routing_struc(n)%resopdir,rc=status)
+          call LIS_verify(status,&
+               "HYMAP3 reservoir operation input directory: not defined")
+
+          call ESMF_ConfigFindLabel(LIS_config,&
+               "HYMAP3 reservoir operation header filename:",rc=status)
+          call ESMF_ConfigGetAttribute(LIS_config,&
+               HYMAP3_routing_struc(n)%resopheader,rc=status)
+          call LIS_verify(status,&
+               "HYMAP3 reservoir operation header filename: not defined")
+          !ag(27Jul2025)
+          call HYMAP3_read_header_size1( &
+               trim(HYMAP3_routing_struc(n)%resopheader),&
+               HYMAP3_routing_struc(n)%nresop, &
+               HYMAP3_routing_struc(n)%ntresop)
+
+          allocate(HYMAP3_routing_struc(n)%resoploc( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%resoploc_dwn( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%resoploc_glb( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%resoploc_dwn_glb( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%resopoutmin( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%tresopalt( &
+               HYMAP3_routing_struc(n)%nresop, &
+               HYMAP3_routing_struc(n)%ntresop))
+          allocate(HYMAP3_routing_struc(n)%resopalt( &
+               HYMAP3_routing_struc(n)%nresop, &
+               HYMAP3_routing_struc(n)%ntresop))
+          allocate(HYMAP3_routing_struc(n)%resoptype( &
+               HYMAP3_routing_struc(n)%nresop))
+
+          !ag(11Oct2024)
+          allocate(HYMAP3_routing_struc(n)%elevtn_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%fldhgt_resop( &
+               HYMAP3_routing_struc(n)%nresop,HYMAP3_routing_struc(n)%nz))
+          allocate(HYMAP3_routing_struc(n)%fldstomax_resop( &
+               HYMAP3_routing_struc(n)%nresop,HYMAP3_routing_struc(n)%nz))
+          allocate(HYMAP3_routing_struc(n)%grarea_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%rivstomax_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%rivelv_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%rivlen_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%rivwth_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+
+          HYMAP3_routing_struc(n)%resoploc = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%resoploc_dwn = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%resoploc_glb = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%resoploc_dwn_glb = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%resopoutmin = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%tresopalt = &
+               dble(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%resopalt = &
+               real(HYMAP3_routing_struc(n)%imis)
+
+          !ag(11Oct2024)
+          HYMAP3_routing_struc(n)%elevtn_resop = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%fldhgt_resop = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%fldstomax_resop = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%grarea_resop = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%rivstomax_resop = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%rivelv_resop = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%rivlen_resop = &
+               real(HYMAP3_routing_struc(n)%imis)
+          HYMAP3_routing_struc(n)%rivwth_resop = &
+               real(HYMAP3_routing_struc(n)%imis)
+
           call HYMAP3_get_data_resop_alt(n, &
                HYMAP3_routing_struc(n)%resopdir,&
                HYMAP3_routing_struc(n)%resopheader,&
@@ -2014,6 +2057,7 @@ contains
                HYMAP3_routing_struc(n)%resopoutmin<0.) &
                HYMAP3_routing_struc(n)%resopoutmin=0.
 
+          !ag(11Oct2024)
           allocate(elevtn_glb(LIS_rc%glbnroutinggrid(n)))
           allocate(grarea_glb(LIS_rc%glbnroutinggrid(n)))
           allocate(rivelv_glb(LIS_rc%glbnroutinggrid(n)))
@@ -2071,92 +2115,375 @@ contains
           deallocate(rivstomax_glb)
           deallocate(fldstomax_glb)
 
-       !Yassin's scheme
+          !ag(4Apr2025)
+          !Yassin's scheme
        elseif(HYMAP3_routing_struc(n)%resopflag==2)then
-          call HYMAP3_read_header_resop_yassin(n, &
-               HYMAP3_routing_struc(n)%resopheader,&
-               HYMAP3_routing_struc(n)%nresop,&
-               HYMAP3_routing_struc(n)%resoploc,&
-               HYMAP3_routing_struc(n)%resoploc_dwn,&
-               HYMAP3_routing_struc(n)%resoploc_glb,&
-               HYMAP3_routing_struc(n)%resoploc_dwn_glb,&
-               HYMAP3_routing_struc(n)%ncloc_resop)
+          call ESMF_ConfigFindLabel(LIS_config,&
+               "HYMAP3 reservoir operation input file:",rc=status)
+          call ESMF_ConfigGetAttribute(LIS_config,&
+               HYMAP3_routing_struc(n)%resopncfile,rc=status)
+          call LIS_verify(status,&
+               "HYMAP3 reservoir operation input file: not defined")
+
+          call HYMAP3_nc_get_dimlen(trim(HYMAP3_routing_struc(n)%resopncfile),&
+               'res_count', ngres)
+
+          call HYMAP3_nc_get_dimlen(trim(HYMAP3_routing_struc(n)%resopncfile),&
+               'curve_pts', HYMAP3_routing_struc(n)%ncurve_max_resop)
+
+          allocate(id_global_resop(ngres))
+          allocate(resop_lon(ngres))
+          allocate(resop_lat(ngres))
+          allocate(resop_uparea(ngres))
+          allocate(resop_id_tmp(ngres))
+          allocate(node_id_tmp(ngres))
+
+          call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+               'id', id_global_resop)
+          call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+               'lon', resop_lon)
+          call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+               'lat', resop_lat)
+          call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+               'drain_area', resop_uparea)
+
+          !ag(25Jan2026)
+          allocate(node_lon(HYMAP3_routing_struc(n)%nseqall))
+          allocate(node_lat(HYMAP3_routing_struc(n)%nseqall))
+          allocate(uparea(HYMAP3_routing_struc(n)%nseqall))
+          allocate(tmp_real(LIS_rc%lnc(n),LIS_rc%lnr(n)))
+
+          ctitle = 'HYMAP_node_lon'
+          call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
+          call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),&
+               1,HYMAP3_routing_struc(n)%nseqall,&
+               HYMAP3_routing_struc(n)%imis,&
+               HYMAP3_routing_struc(n)%seqx,&
+               HYMAP3_routing_struc(n)%seqy,&
+               tmp_real,node_lon)
+
+          ctitle = 'HYMAP_node_lat'
+          call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
+          call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),&
+               1,HYMAP3_routing_struc(n)%nseqall,&
+               HYMAP3_routing_struc(n)%imis,&
+               HYMAP3_routing_struc(n)%seqx,&
+               HYMAP3_routing_struc(n)%seqy,&
+               tmp_real,node_lat)
+
+          ctitle = 'HYMAP_drain_area'
+          call HYMAP3_read_param_real_2d(ctitle,n,tmp_real)
+          call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),&
+               1,HYMAP3_routing_struc(n)%nseqall,&
+               HYMAP3_routing_struc(n)%imis,&
+               HYMAP3_routing_struc(n)%seqx,&
+               HYMAP3_routing_struc(n)%seqy,&
+               tmp_real,uparea)
+
+          ! Reservoir locations must be in the GLOBAL sindex space on every
+          ! rank. HYMAP3_model_core executes the full reservoir list on rank 0.
+          allocate(node_x_glb(LIS_rc%glbnroutinggrid(n)))
+          allocate(node_y_glb(LIS_rc%glbnroutinggrid(n)))
+          node_x_glb=0
+          node_y_glb=0
+          do l=1,LIS_npes
+             do k=1,LIS_routing_gdeltas(n,l-1)
+                i=k+LIS_routing_goffsets(n,l-1)
+                ix=HYMAP3_routing_struc(n)%seqx_glb(i)+ &
+                     LIS_ews_halo_ind(n,l)-1
+                iy=HYMAP3_routing_struc(n)%seqy_glb(i)+ &
+                     LIS_nss_halo_ind(n,l)-1
+                icg=HYMAP3_routing_struc(n)%sindex(ix,iy)
+                node_x_glb(icg)=ix
+                node_y_glb(icg)=iy
+             enddo
+          enddo
+
+          !ag(18Jun2026)
+          allocate(resop_x(ngres))
+          allocate(resop_y(ngres))
+          call HYMAP3_nc_var_exists(HYMAP3_routing_struc(n)%resopncfile,'x',flag_x)
+          call HYMAP3_nc_var_exists(HYMAP3_routing_struc(n)%resopncfile,'y',flag_y)
+          if (flag_x.and.flag_y) then
+             call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                  'x',resop_x)
+             call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                  'y',resop_y)
+             HYMAP3_routing_struc(n)%nresop=0
+             do iresop=1,ngres
+                ix=resop_x(iresop)
+                iy=resop_y(iresop)
+                if(ix<1.or.ix>LIS_rc%gnc(n).or. &
+                     iy<1.or.iy>LIS_rc%gnr(n))cycle
+                icg=HYMAP3_routing_struc(n)%sindex(ix,iy)
+                if(icg<1.or.icg>LIS_rc%glbnroutinggrid(n))cycle
+                icg_down=HYMAP3_routing_struc(n)%next_glb(icg)
+                if(icg_down<1.or.icg_down>LIS_rc%glbnroutinggrid(n))cycle
+                HYMAP3_routing_struc(n)%nresop=HYMAP3_routing_struc(n)%nresop+1
+                j=HYMAP3_routing_struc(n)%nresop
+                resop_id_tmp(j)=iresop
+                node_id_tmp(j)=icg
+             enddo
+          else
+
+             ! Gather from all MPI ranks before matching; local indices are
+             ! neither globally valid nor comparable between processors.
+             allocate(node_lon_glb(LIS_rc%glbnroutinggrid(n)))
+             allocate(node_lat_glb(LIS_rc%glbnroutinggrid(n)))
+             allocate(uparea_glb(LIS_rc%glbnroutinggrid(n)))
+             allocate(resop_mask_glb(LIS_rc%glbnroutinggrid(n)))
+             call HYMAP3_gather_tiles(n,node_lon,node_lon_glb)
+             call HYMAP3_gather_tiles(n,node_lat,node_lat_glb)
+             call HYMAP3_gather_tiles(n,uparea,uparea_glb)
+             ! Only nodes with a valid downstream global cell can be operated.
+             resop_mask_glb=HYMAP3_routing_struc(n)%imis
+             where(HYMAP3_routing_struc(n)%next_glb>=1.and. &
+                  HYMAP3_routing_struc(n)%next_glb<=LIS_rc%glbnroutinggrid(n)) &
+                  resop_mask_glb=1
+             HYMAP3_routing_struc(n)%nresop=0
+             if(LIS_masterproc)then
+                call HYMAP3_match_points(ngres, resop_lon, resop_lat, resop_uparea, &
+                     LIS_rc%glbnroutinggrid(n), &
+                     dble(node_lon_glb), dble(node_lat_glb), dble(uparea_glb), &
+                     resop_mask_glb, HYMAP3_routing_struc(n)%imis, &
+                     1.5d-1, 1.5d-1, 7.0d-1, 3.0d-1, &
+                     HYMAP3_routing_struc(n)%nresop, resop_id_tmp,node_id_tmp)
+             endif
+#if (defined SPMD)
+             call MPI_BCAST(HYMAP3_routing_struc(n)%nresop,1,MPI_INTEGER,0, &
+                  LIS_mpi_comm,status)
+             if(HYMAP3_routing_struc(n)%nresop>0)then
+                call MPI_BCAST(resop_id_tmp,HYMAP3_routing_struc(n)%nresop, &
+                     MPI_INTEGER,0,LIS_mpi_comm,status)
+                call MPI_BCAST(node_id_tmp,HYMAP3_routing_struc(n)%nresop, &
+                     MPI_INTEGER,0,LIS_mpi_comm,status)
+             endif
+#endif
+             deallocate(node_lon_glb,node_lat_glb,uparea_glb,resop_mask_glb)
+          endif
+
+
+          ! Translate the GLOBAL matched indices to coordinates for reporting
+          ! and to local indices only where a processor owns the node.
+          if(LIS_masterproc)write(LIS_logunit,*) &
+               '[INFO] HYMAP3 Yassin reservoirs matched globally:', &
+               HYMAP3_routing_struc(n)%nresop,' of ',ngres
           do iresop=1,HYMAP3_routing_struc(n)%nresop
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile,&
-                  1,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'max_sto',&
-                  HYMAP3_routing_struc(n)%maxsto_resop(iresop))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile,&
-                  1,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'init_dis',&
-                  HYMAP3_routing_struc(n)%inidis_resop(iresop))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile,&
-                  1,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'init_sto',&
-                  HYMAP3_routing_struc(n)%inisto_resop(iresop))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile,&
-                  1,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'down_dis',&
-                  HYMAP3_routing_struc(n)%dwndis_resop(iresop))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile, &
-                  1,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'dead_sto',&
-                  HYMAP3_routing_struc(n)%deadis_resop(iresop))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile, &
-                  12,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'mon_min_sto',&
-                  HYMAP3_routing_struc(n)%minsto_mo_resop(iresop,:))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile, &
-                  12,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'mon_nupper_sto',&
-                  HYMAP3_routing_struc(n)%nupsto_mo_resop(iresop,:))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile, &
-                  12,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'mon_upper_sto',&
-                  HYMAP3_routing_struc(n)%uppsto_mo_resop(iresop,:))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile,&
-                  12,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'mon_min_dis',&
-                  HYMAP3_routing_struc(n)%mindis_mo_resop(iresop,:))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile, &
-                  12,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'mon_nupper_dis',&
-                  HYMAP3_routing_struc(n)%nupdis_mo_resop(iresop,:))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile,&
-                  12,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'mon_upper_dis',&
-                  HYMAP3_routing_struc(n)%uppdis_mo_resop(iresop,:))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile,&
-                  1,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'poly_a',&
-                  HYMAP3_routing_struc(n)%reg1_resop(iresop))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile,&
-                  1,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'poly_b',&
-                  HYMAP3_routing_struc(n)%reg2_resop(iresop))
-             call read_netcdf_1d_real( &
-                  HYMAP3_routing_struc(n)%resopncfile,&
-                  1,1,HYMAP3_routing_struc(n)%ncloc_resop(iresop),1, &
-                  'poly_c',&
-                  HYMAP3_routing_struc(n)%reg3_resop(iresop))
+             icg=node_id_tmp(iresop)
+             resop_x(iresop)=node_x_glb(icg)
+             resop_y(iresop)=node_y_glb(icg)
+             if(LIS_masterproc)write(LIS_logunit,'(3i8,2f15.3)') &
+                  resop_id_tmp(iresop),resop_x(iresop),resop_y(iresop), &
+                  resop_lon(resop_id_tmp(iresop)),resop_lat(resop_id_tmp(iresop))
+          enddo
+          deallocate(node_lon,node_lat,uparea,tmp_real)
+          deallocate(resop_lon,resop_lat,resop_uparea)
+
+          allocate(HYMAP3_routing_struc(n)%resoploc( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%resoploc_dwn( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%resoploc_glb( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%resoploc_dwn_glb( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%maxsto_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%inidis_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%inisto_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%dwndis_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%deadis_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%minsto_mo_resop( &
+               HYMAP3_routing_struc(n)%nresop,12))
+          allocate(HYMAP3_routing_struc(n)%nupsto_mo_resop( &
+               HYMAP3_routing_struc(n)%nresop,12))
+          allocate(HYMAP3_routing_struc(n)%uppsto_mo_resop( &
+               HYMAP3_routing_struc(n)%nresop,12))
+          allocate(HYMAP3_routing_struc(n)%mindis_mo_resop( &
+               HYMAP3_routing_struc(n)%nresop,12))
+          allocate(HYMAP3_routing_struc(n)%nupdis_mo_resop( &
+               HYMAP3_routing_struc(n)%nresop,12))
+          allocate(HYMAP3_routing_struc(n)%uppdis_mo_resop( &
+               HYMAP3_routing_struc(n)%nresop,12))
+          allocate(HYMAP3_routing_struc(n)%ncurve_resop( &
+               HYMAP3_routing_struc(n)%nresop))
+          allocate(HYMAP3_routing_struc(n)%elev_curve_resop( &
+               HYMAP3_routing_struc(n)%nresop,&
+               HYMAP3_routing_struc(n)%ncurve_max_resop))
+          allocate(HYMAP3_routing_struc(n)%vol_curve_resop( &
+               HYMAP3_routing_struc(n)%nresop,&
+               HYMAP3_routing_struc(n)%ncurve_max_resop))
+
+          do iresop=1,HYMAP3_routing_struc(n)%nresop
+
+            icg=node_id_tmp(iresop) ! Already a GLOBAL sindex index
+            icg_down=HYMAP3_routing_struc(n)%next_glb(icg)
+            if(icg_down<1.or.icg_down>LIS_rc%glbnroutinggrid(n))then
+               write(LIS_logunit,*) '[ERR] Yassin reservoir downstream index:', &
+                    resop_id_tmp(iresop),icg,icg_down
+               call LIS_endrun()
+            endif
+            call HYMAP3_map_gxy2l_index(n,resop_x(iresop),resop_y(iresop),ic)
+            call HYMAP3_map_gxy2l_index(n, &
+                 node_x_glb(icg_down),node_y_glb(icg_down),j)
+
+            HYMAP3_routing_struc(n)%resoploc(iresop)=ic
+            HYMAP3_routing_struc(n)%resoploc_dwn(iresop)=j
+
+            HYMAP3_routing_struc(n)%resoploc_glb(iresop)=icg
+
+            HYMAP3_routing_struc(n)%resoploc_dwn_glb(iresop)=icg_down
+
+            ncloc_resop=resop_id_tmp(iresop)
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'max_sto', HYMAP3_routing_struc(n)%maxsto_resop(iresop),&
+                 start=ncloc_resop, count=1)
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'init_dis', HYMAP3_routing_struc(n)%inidis_resop(iresop),&
+                 start=ncloc_resop, count=1)
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'init_sto', HYMAP3_routing_struc(n)%inisto_resop(iresop),&
+                 start=ncloc_resop, count=1)
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'down_dis', HYMAP3_routing_struc(n)%dwndis_resop(iresop),&
+                 start=ncloc_resop, count=1)
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'dead_sto', HYMAP3_routing_struc(n)%deadis_resop(iresop),&
+                 start=ncloc_resop, count=1)
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'mon_min_sto', HYMAP3_routing_struc(n)%minsto_mo_resop(iresop,:),&
+                 start=(/ncloc_resop,1/), count=(/1,12/))
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'mon_nupper_sto', HYMAP3_routing_struc(n)%nupsto_mo_resop(iresop,:),&
+                 start=(/ncloc_resop,1/), count=(/1,12/))
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'mon_upper_sto', HYMAP3_routing_struc(n)%uppsto_mo_resop(iresop,:),&
+                 start=(/ncloc_resop,1/), count=(/1,12/))
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'mon_min_dis', HYMAP3_routing_struc(n)%mindis_mo_resop(iresop,:),&
+                 start=(/ncloc_resop,1/), count=(/1,12/))
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'mon_nupper_dis', HYMAP3_routing_struc(n)%nupdis_mo_resop(iresop,:),&
+                 start=(/ncloc_resop,1/), count=(/1,12/))
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'mon_upper_dis', HYMAP3_routing_struc(n)%uppdis_mo_resop(iresop,:),&
+                 start=(/ncloc_resop,1/), count=(/1,12/))
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'n_curve', HYMAP3_routing_struc(n)%ncurve_resop(iresop),&
+                 start=ncloc_resop, count=1)
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'elev_curve', HYMAP3_routing_struc(n)%elev_curve_resop(iresop,:),&
+                 start=(/ncloc_resop,1/), count=(/1,HYMAP3_routing_struc(n)%ncurve_max_resop/))
+            call HYMAP3_nc_get(trim(HYMAP3_routing_struc(n)%resopncfile),&
+                 'vol_curve', HYMAP3_routing_struc(n)%vol_curve_resop(iresop,:),&
+                 start=(/ncloc_resop,1/), count=(/1,HYMAP3_routing_struc(n)%ncurve_max_resop/))
+          enddo
+
+!All lines using rivelv must be move to below the following block, where rivelv is calculated
+
+!Check line 2169 HYMAP3_routing_struc(n)%resoploc_dwn_glb(iresop)=HYMAP3_routing_struc(n)%next(icg)
+!next should be a local array, not global
+!It's been working because it only runs with a single processor
+
+          if(allocated(uparea))deallocate(uparea)
+
+          deallocate(node_x_glb,node_y_glb)
+          ! The July-2026 reservoir cold-start filling experiment has been
+          ! disabled. It contained unfinished loops, accessed next_glb(0),
+          ! and inspected startmode before it was read from lis.config.
+          ! Yassin reservoir operations themselves remain enabled.
+          ! retained verbatim as historical work. The working replacement
+
+       endif
+    enddo
+
+
+    write(LIS_logunit,*) '[INFO] Processing data before running HYMAP'
+    do n=1, LIS_rc%nnest
+       write(LIS_logunit,*)'[INFO] Calculate maximum river storage'
+
+       if(HYMAP3_routing_struc(n)%useens.eq.0) then
+          do i=1,HYMAP3_routing_struc(n)%nseqall
+             HYMAP3_routing_struc(n)%rivstomax(i,1) = &
+                  HYMAP3_routing_struc(n)%rivlen(i) * &
+                  HYMAP3_routing_struc(n)%rivwth(i,1) * &
+                  HYMAP3_routing_struc(n)%rivhgt(i,1)
+             !ag(23Feb2023) (22May2024)
+             HYMAP3_routing_struc(n)%levstomax(i,1) = &
+                  HYMAP3_routing_struc(n)%rivlen(i) * &
+                  HYMAP3_routing_struc(n)%rivwth(i,1) * &
+                  HYMAP3_routing_struc(n)%levhgt(i)
+             HYMAP3_routing_struc(n)%rivelv(i) = &
+                  HYMAP3_routing_struc(n)%elevtn(i) - &
+                  HYMAP3_routing_struc(n)%rivhgt(i,1)
+             if(HYMAP3_routing_struc(n)%rivwth(i,1)>0) then
+                HYMAP3_routing_struc(n)%rivare(i,1) = &
+                     min(HYMAP3_routing_struc(n)%grarea(i), &
+                     HYMAP3_routing_struc(n)%rivlen(i) * &
+                     HYMAP3_routing_struc(n)%rivwth(i,1))
+             endif
+          enddo
+
+          call HYMAP3_set_fldstg(HYMAP3_routing_struc(n)%nz,&
+               HYMAP3_routing_struc(n)%nseqall,&
+               HYMAP3_routing_struc(n)%fldhgt,&
+               HYMAP3_routing_struc(n)%grarea,&
+               HYMAP3_routing_struc(n)%rivlen,&
+               HYMAP3_routing_struc(n)%rivwth(:,1),&
+               HYMAP3_routing_struc(n)%rivstomax(:,1),&
+               HYMAP3_routing_struc(n)%levhgt,&
+               HYMAP3_routing_struc(n)%fldstomax(:,:,1),&
+               HYMAP3_routing_struc(n)%fldgrd(:,:,1),&
+               HYMAP3_routing_struc(n)%rivare(:,1),&
+               HYMAP3_routing_struc(n)%fldonlystomax(:,:,1),&
+               HYMAP3_routing_struc(n)%fldstoatlev(:,1))
+       else
+          do i=1,HYMAP3_routing_struc(n)%nseqall
+             do m=1,LIS_rc%nensem(n)
+                HYMAP3_routing_struc(n)%rivstomax(i,m) = &
+                     HYMAP3_routing_struc(n)%rivlen(i) * &
+                     HYMAP3_routing_struc(n)%rivwth(i,m) * &
+                     HYMAP3_routing_struc(n)%rivhgt(i,m)
+                !ag(23Feb2023) (22May2024)
+                HYMAP3_routing_struc(n)%levstomax(i,m) = &
+                     HYMAP3_routing_struc(n)%rivlen(i) * &
+                     HYMAP3_routing_struc(n)%rivwth(i,m) * &
+                     HYMAP3_routing_struc(n)%levhgt(i)
+                HYMAP3_routing_struc(n)%rivelv(i) = &
+                     HYMAP3_routing_struc(n)%elevtn(i) - &
+                     HYMAP3_routing_struc(n)%rivhgt(i,m)
+                if(HYMAP3_routing_struc(n)%rivwth(i,m)>0) then
+                   HYMAP3_routing_struc(n)%rivare(i,m) = &
+                        min(HYMAP3_routing_struc(n)%grarea(i), &
+                        HYMAP3_routing_struc(n)%rivlen(i) * &
+                        HYMAP3_routing_struc(n)%rivwth(i,m))
+                endif
+             enddo
+          enddo
+
+          do m=1,LIS_rc%nensem(n)
+             call HYMAP3_set_fldstg(HYMAP3_routing_struc(n)%nz,&
+                  HYMAP3_routing_struc(n)%nseqall,&
+                  HYMAP3_routing_struc(n)%fldhgt,&
+                  HYMAP3_routing_struc(n)%grarea,&
+                  HYMAP3_routing_struc(n)%rivlen,&
+                  HYMAP3_routing_struc(n)%rivwth(:,m),&
+                  HYMAP3_routing_struc(n)%rivstomax(:,m),&
+                  HYMAP3_routing_struc(n)%levhgt,&
+                  HYMAP3_routing_struc(n)%fldstomax(:,:,m),&
+                  HYMAP3_routing_struc(n)%fldgrd(:,:,m),&
+                  HYMAP3_routing_struc(n)%rivare(:,m),&
+                  HYMAP3_routing_struc(n)%fldstoatlev(:,m),&
+                  HYMAP3_routing_struc(n)%fldonlystomax(:,:,m))
           enddo
        endif
     enddo
 
-    ! read urban flood data
+    !ag(27Apr2020) - read urban flood data
     do n=1, LIS_rc%nnest
        if(HYMAP3_routing_struc(n)%flowtype==4)then
           write(LIS_logunit,*)'[INFO] Setting urban drainage parameters'
@@ -2196,7 +2523,7 @@ contains
        endif
     enddo
 
-    ! read discharge data for direct insertion
+    !ag(8Aug2020) - read discharge data for direct insertion
     do n=1, LIS_rc%nnest
        if(HYMAP3_routing_struc(n)%insertflag==1)then
           call HYMAP3_get_discharge_data( &
@@ -2212,7 +2539,7 @@ contains
        endif
     enddo
 
-    ! read sea level data
+    !ag(30Mar2021) - read sea level data
     do n=1, LIS_rc%nnest
        if(HYMAP3_routing_struc(n)%sealevelflag==1)then
           call HYMAP3_get_sea_level_data(n, &
@@ -2229,7 +2556,7 @@ contains
        endif
     enddo
 
-    ! read water management header file
+    !ag(30Apr2021) - read water management header file
     do n=1, LIS_rc%nnest
        if(HYMAP3_routing_struc(n)%managflag==1)then
           !get number of water management locations
@@ -2263,9 +2590,10 @@ contains
        endif
     enddo
 
-    ! read bifurcation pathway file
+    !ag(7Sep2022) - read bifurcation pathway file
     do n=1, LIS_rc%nnest
        if(HYMAP3_routing_struc(n)%bifflag==1)then
+          !ag(27Jul2025)
           !get number of bifurcations and elevations
           allocate(HYMAP3_routing_struc(n)%bifloc( &
                HYMAP3_routing_struc(n)%nbif,2))
@@ -2387,9 +2715,61 @@ contains
             "HYMAP3 routing model restart file: not defined")
     enddo
 
+    !ag (21Nov2026) Network MPI phase 2: Levees use local geometry and
+    ! already work with network MPI. Reservoirs, bifurcations, management,
+    ! and streamflow insertion now use compact owner-to-root cell exchange.
+    ! This guard is intentionally explicit, never silently skip physics.
+    do n=1,LIS_rc%nnest
+       if(HYMAP3_routing_struc(n)%network_mpi_flag==1)then
+          !ag (21Nov2026) Urban network MPI:
+          ! Urban is now supported by a separate sparse drainage graph.
+          ! Preserve only the pre-existing vector-input exclusion.
+          if(HYMAP3_routing_struc(n)%vecflag/=0)then
+             write(LIS_logunit,*) &
+                  '[WARN] HYMAP3 network MPI: optional global operator active; using legacy communication'
+             HYMAP3_routing_struc(n)%network_mpi_flag=0
+          else
+             !ag (21Nov2026) Network MPI: Defer building until every
+             ! optional physics flag is known, so excluded operators do
+             ! not allocate an unused graph.
+#if !(defined SPMD)
+             ! Single-rank LIS does not assemble rank-order sequences.
+             LIS_routing_gdeltas(n,0)=LIS_rc%nroutinggrid(n)
+             LIS_routing_goffsets(n,0)=0
+             HYMAP3_routing_struc(n)%seqx_glb=HYMAP3_routing_struc(n)%seqx
+             HYMAP3_routing_struc(n)%seqy_glb=HYMAP3_routing_struc(n)%seqy
+#endif
+             call HYMAP3_network_build(n)
+             !ag (21Nov2026) Urban network MPI: Precompute directed urban
+             ! drainage links once, including sources excluded from the
+             ! normal river-flow graph. No global transfers per timestep.
+             if(HYMAP3_routing_struc(n)%flowtype==4)then
+                call HYMAP3_network_build_urban(n)
+             endif
+             !ag (21Nov2026) Network MPI phase 2: Discover extra edges
+             ! only after all optional operator locations are loaded.
+             call HYMAP3_network_build_operator_map(n)
+             write(LIS_logunit,*) &
+                  '[INFO] HYMAP3 network MPI: direct upstream/downstream exchanges enabled',n
+          endif
+       endif
+    enddo
+
     if(LIS_rc%lsm.eq."none") then
        call initrunoffdata(trim(LIS_rc%runoffdatasource)//char(0))
     endif
+
+    !ag(22Apr2026)
+    !coldstart reservoir water storage
+    do n=1, LIS_rc%nnest
+      if(HYMAP3_routing_struc(n)%resopflag==2.and.&
+         HYMAP3_routing_struc(n)%startmode=='coldstart')then
+         ! initialize only AFTER startmode and channel/floodplain geometry exist.
+         ! Every MPI rank participates in gathers and broadcasts; rank 0
+         ! constructs each reservoir's connected, level-water impoundment.
+         call HYMAP3_init_reservoir_coldstart(n)
+      endif
+    enddo
 
     do n=1, LIS_rc%nnest
        call ESMF_ArraySpecSet(realarrspec,rank=1, &
@@ -2448,6 +2828,7 @@ contains
 
        HYMAP3_routing_struc(n)%mo = -1
 
+       !ag (12Sep2019)
        call ESMF_AttributeSet(LIS_runoff_state(n),"2 way coupling",&
             0, rc=status)
        call LIS_verify(status)
@@ -3009,58 +3390,9 @@ contains
   end subroutine HYMAP3_vector_read_param
 
   !======================================================================
-  subroutine read_netcdf_1d_real(infile, ntiles, jt, it, nt, yvar, var)
-
-    !USES:
-    use LIS_coreMod
-    use LIS_logMod
-#if (defined USE_NETCDF3 || defined USE_NETCDF4)
-    use netcdf
-#endif
-
-    implicit none
-
-    character(*), intent(in)  :: infile,yvar
-    integer,      intent(in)  :: ntiles,jt,it,nt
-    real*8,         intent(out) :: var(ntiles)
-
-    integer                   :: varid
-    integer                     :: ftn
-    logical                     :: file_exists
-
-#if (defined USE_NETCDF3 || defined USE_NETCDF4)
-    inquire(file=trim(infile),exist=file_exists)
-    if(file_exists) then
-       call LIS_verify(nf90_open(path=trim(infile),&
-            mode=NF90_NOWRITE, ncid = ftn), &
-            'nf90_open failed in read_netcdf_1d_real in HYMAP3_routingMod')
-       call LIS_verify(nf90_inq_varid(ftn,trim(yvar),varid), &
-            'nf90_inq_varid failed for '//trim(yvar)//&
-            ' in read_netcdf_1d_real in HYMAP3_routingMod')
-
-       call LIS_verify(nf90_get_var(ftn,varid, var,&
-            start=(/it,jt/),&
-            count=(/nt,ntiles/)),&
-            'nf90_get_var failed for '//trim(yvar)//&
-            ' in read_netcdf_1d_real in HYMAP3_routingMod')
-
-       call LIS_verify(nf90_close(ftn),&
-            'nf90_close failed in HYMAP3_routingMod')
-
-    else
-       write(LIS_logunit,*) '[ERR] parameter input file '//trim(infile)
-       write(LIS_logunit,*) &
-            '[ERR] failed in read_netcdf_1d_real in HYMAP3_routingMod'
-       call LIS_endrun()
-    endif
-#endif
-
-  end subroutine read_netcdf_1d_real
-  !===============================================================================
   subroutine HYMAP3_read_header_resop_yassin(n, yheader, inst, &
        local_index, down_local_index, glb_index, down_glb_index, &
        nc_index)
-
     use LIS_logMod
 
     implicit none
@@ -3082,7 +3414,7 @@ contains
       !get name of station files
        write(LIS_logunit,*) &
             '[INFO] [read_header] get stations info: name and coordinates'
-       write(LIS_logunit,*)'[INFO] [read_header] ',yheader,inst
+       write(LIS_logunit,*)'[INFO] [read_header] ',trim(yheader),' ',inst
        ftn = LIS_getNextUnitNumber()
        open(ftn,file=trim(yheader), status='old')
        read(ftn,*)
@@ -3504,6 +3836,7 @@ contains
   end subroutine HYMAP3_read_header_size
   !=============================================
   !=============================================
+  !ag(27Jul2025)
   subroutine HYMAP3_read_header_size1(yheader, isize, isize1)
 
     use LIS_logMod
@@ -3694,6 +4027,7 @@ contains
             '[INFO] [read_header] get stations info: name and coordinates'
        write(LIS_logunit,*)'[INFO] [read_header] ',yheader,inst
        open(ftn,file=trim(yheader), status='old')
+       !ag(27Jul2025)
        read(ftn,*)
        do ist=1,inst
           read(ftn,*,end=10)yqname(ist),ix,iy,outmin(ist),resoptype(ist)
@@ -3809,7 +4143,270 @@ contains
 
   end subroutine HYMAP3_read_time_series
   !=============================================
-  !=============================================
+  !ag(27Apr2020)
+  ! ================================================
+  !======================================================================
+  !ag (21Nov2026) Reservoir cold start: NEW ROUTINES ONLY; legacy code retained.
+  ! Set Yassin reservoir cells to the water-surface elevation corresponding
+  ! to their max_sto and extend that level upstream through connected cells.
+  ! This is an initial condition, NOT a time-stepping or water-balance flux.
+  ! max_sto refers to the WHOLE reservoir, not just the dam grid cell: the
+  ! dam cell's modeled volume follows its local river/floodplain geometry.
+  !======================================================================
+  subroutine HYMAP3_init_reservoir_coldstart(n)
+    use LIS_coreMod
+    use LIS_logMod
+    use LIS_mpiMod
+    use HYMAP3_modelMod, only: HYMAP3_get_volume_profile
+    implicit none
+    integer, intent(in) :: n
+    integer :: ng, nz, nm, m, j, iz, ir, nwet, nactive, ierr
+    real, allocatable :: elev(:), bed(:), area(:), length(:), width(:)
+    real, allocatable :: rcap(:), fcap(:,:), fhgt(:,:)
+    real, allocatable :: rstore(:), fstore(:), local_bed(:)
+    real*8, allocatable :: targets(:), levels(:)
+    logical, allocatable :: valid(:)
+    real*8 :: vol, channel_vol, sumvol
+    logical :: ok
+#if (defined SPMD)
+    external :: MPI_BCAST
+#endif
+
+    ng = LIS_rc%glbnroutinggrid(n)
+    nz = HYMAP3_routing_struc(n)%nz
+    if(ng<=0.or.HYMAP3_routing_struc(n)%nresop<=0)then
+       if(LIS_masterproc)write(LIS_logunit,*) &
+            '[INFO] Yassin coldstart: no matched reservoirs'
+       return
+    endif
+
+    nm=1
+    if(HYMAP3_routing_struc(n)%useens/=0)nm=LIS_rc%nensem(n)
+    allocate(elev(ng),bed(ng),area(ng),length(ng),width(ng),rcap(ng))
+    allocate(fhgt(ng,nz),fcap(ng,nz),rstore(ng),fstore(ng))
+    allocate(local_bed(LIS_rc%nroutinggrid(n)))
+    allocate(targets(HYMAP3_routing_struc(n)%nresop))
+    allocate(valid(HYMAP3_routing_struc(n)%nresop),levels(ng))
+
+    ! The reservoir's capacity level is independent of MPI decomposition.
+    ! Invalid/nonmonotonic capacity curves are skipped with a diagnostic.
+    targets=-huge(1.d0)
+    valid=.false.
+    if(LIS_masterproc)then
+       do ir=1,HYMAP3_routing_struc(n)%nresop
+          j=HYMAP3_routing_struc(n)%ncurve_resop(ir)
+          if(j<2.or.j>HYMAP3_routing_struc(n)%ncurve_max_resop)cycle
+          call HYMAP3_coldstart_capacity_elevation(j, &
+               HYMAP3_routing_struc(n)%vol_curve_resop(ir,1:j), &
+               HYMAP3_routing_struc(n)%elev_curve_resop(ir,1:j), &
+               HYMAP3_routing_struc(n)%maxsto_resop(ir),targets(ir),ok)
+          valid(ir)=ok
+          if(ok)then
+             if(HYMAP3_routing_struc(n)%maxsto_resop(ir)< &
+                  HYMAP3_routing_struc(n)%vol_curve_resop(ir,1).or. &
+                  HYMAP3_routing_struc(n)%maxsto_resop(ir)> &
+                  HYMAP3_routing_struc(n)%vol_curve_resop(ir,j))then
+                write(LIS_logunit,*) &
+                     '[WARN] Yassin coldstart extrapolating capacity curve:',ir
+             endif
+          endif
+          if(.not.ok)write(LIS_logunit,*) &
+               '[WARN] Yassin coldstart invalid capacity curve:',ir
+       enddo
+    endif
+#if (defined SPMD)
+    call MPI_BCAST(targets,size(targets),MPI_DOUBLE_PRECISION,0, &
+         LIS_mpi_comm,ierr)
+    call MPI_BCAST(valid,size(valid),MPI_LOGICAL,0,LIS_mpi_comm,ierr)
+#endif
+
+    ! Global fields follow HyMAP's existing all-gather tile ordering. In
+    ! non-SPMD builds the helper copies by global sindex without MPI.
+    call HYMAP3_coldstart_gather(n,HYMAP3_routing_struc(n)%elevtn,elev)
+    call HYMAP3_coldstart_gather(n,HYMAP3_routing_struc(n)%grarea,area)
+    call HYMAP3_coldstart_gather(n,HYMAP3_routing_struc(n)%rivlen,length)
+    do iz=1,nz
+       call HYMAP3_coldstart_gather(n, &
+            HYMAP3_routing_struc(n)%fldhgt(:,iz),fhgt(:,iz))
+    enddo
+
+    do m=1,nm
+       local_bed=HYMAP3_routing_struc(n)%elevtn - &
+            HYMAP3_routing_struc(n)%rivhgt(:,m)
+       call HYMAP3_coldstart_gather(n,local_bed,bed)
+       call HYMAP3_coldstart_gather(n,HYMAP3_routing_struc(n)%rivwth(:,m),width)
+       call HYMAP3_coldstart_gather(n,HYMAP3_routing_struc(n)%rivstomax(:,m),rcap)
+       do iz=1,nz
+          call HYMAP3_coldstart_gather(n, &
+               HYMAP3_routing_struc(n)%fldstomax(:,iz,m),fcap(:,iz))
+       enddo
+
+       rstore=0.
+       fstore=0.
+       nwet=0
+       sumvol=0.d0
+       if(LIS_masterproc)then
+          call HYMAP3_coldstart_upstream_stages(ng, &
+               HYMAP3_routing_struc(n)%next_glb,bed, &
+               HYMAP3_routing_struc(n)%nresop, &
+               HYMAP3_routing_struc(n)%resoploc_glb,targets,valid,levels)
+          do j=1,ng
+             if(levels(j)==-huge(1.d0))cycle
+             if(area(j)<=0..or.length(j)<=0..or.width(j)<=0.)cycle
+             if(rcap(j)<=0.)cycle
+             if(bed(j)>=levels(j))cycle
+             call HYMAP3_get_volume_profile(nz,dble(elev(j)), &
+                  dble(fhgt(j,:)),dble(fcap(j,:)),dble(area(j)), &
+                  dble(rcap(j)),dble(bed(j)),dble(length(j)), &
+                  dble(width(j)),levels(j),vol)
+             if(vol<=0.d0.or.vol>=real(huge(1.0),8))cycle
+             ! Decompose model volume into the wetted channel and floodplain.
+             ! Below bankfull all storage is river; above bankfull, channel
+             ! storage rises by width*length*overbank depth. The remaining
+             ! volume is floodplain storage, consistent with HyMAP staging.
+             channel_vol=max(0.d0,levels(j)-dble(bed(j)))* &
+                  dble(length(j))*dble(width(j))
+             rstore(j)=real(min(vol,channel_vol))
+             fstore(j)=real(max(0.d0,vol-dble(rstore(j))))
+             nwet=nwet+1
+             sumvol=sumvol+vol
+          enddo
+          nactive=count(valid)
+          write(LIS_logunit,*) &
+               '[INFO] Yassin coldstart: nest/member/reservoirs/wet cells/volume m3:', &
+               n,m,nactive,nwet,sumvol
+       endif
+#if (defined SPMD)
+       call MPI_BCAST(rstore,ng,MPI_REAL,0,LIS_mpi_comm,ierr)
+       call MPI_BCAST(fstore,ng,MPI_REAL,0,LIS_mpi_comm,ierr)
+#endif
+       call HYMAP3_map_g2l(n,rstore,HYMAP3_routing_struc(n)%rivsto(:,m))
+       call HYMAP3_map_g2l(n,fstore,HYMAP3_routing_struc(n)%fldsto(:,m))
+    enddo
+    deallocate(elev,bed,area,length,width,rcap,fhgt,fcap,rstore,fstore)
+    deallocate(local_bed,targets,valid,levels)
+  end subroutine HYMAP3_init_reservoir_coldstart
+
+  !ag (21Nov2026) Reservoir cold start: MPI-compatible global gather with serial fallback.
+  subroutine HYMAP3_coldstart_gather(n,local,global)
+    use LIS_coreMod
+    implicit none
+    integer, intent(in) :: n
+    real, intent(in) :: local(:)
+    real, intent(out) :: global(:)
+#if (defined SPMD)
+    call HYMAP3_gather_tiles(n,local,global)
+#else
+    integer :: j, ig
+    global=0.
+    do j=1,LIS_rc%nroutinggrid(n)
+       call HYMAP3_map_l2g_index(n,j,ig)
+       if(ig>=1.and.ig<=size(global))global(ig)=local(j)
+    enddo
+#endif
+  end subroutine HYMAP3_coldstart_gather
+
+  !ag (21Nov2026) Reservoir cold start: Invert an observed reservoir volume/elevation curve.
+  ! Extrapolate linearly only outside its tabulated volume range, and warn.
+  subroutine HYMAP3_coldstart_capacity_elevation(ncurve,volumes,heights, &
+       capacity,target,valid)
+    use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
+    implicit none
+    integer, intent(in) :: ncurve
+    real*8, intent(in) :: volumes(ncurve),heights(ncurve),capacity
+    real*8, intent(out) :: target
+    logical, intent(out) :: valid
+    integer :: j, k
+    real*8 :: alpha
+    valid=.false.
+    target=-huge(1.d0)
+    if(ncurve<2.or..not.ieee_is_finite(capacity))return
+    if(capacity<=0.d0)return
+    do j=1,ncurve
+       if(.not.ieee_is_finite(volumes(j)).or. &
+          .not.ieee_is_finite(heights(j)))return
+    enddo
+    do j=2,ncurve
+       if(volumes(j)<=volumes(j-1))return
+       if(heights(j)<=heights(j-1))return
+    enddo
+    k=ncurve-1
+    if(capacity<=volumes(1))then
+       k=1
+    elseif(capacity<volumes(ncurve))then
+       do j=1,ncurve-1
+          if(capacity<=volumes(j+1))then
+             k=j
+             exit
+          endif
+       enddo
+    endif
+    alpha=(capacity-volumes(k))/(volumes(k+1)-volumes(k))
+    target=heights(k)+alpha*(heights(k+1)-heights(k))
+    valid=ieee_is_finite(target)
+    if(.not.valid)target=-huge(1.d0)
+  end subroutine HYMAP3_coldstart_capacity_elevation
+
+  !ag (21Nov2026) Reservoir cold start: Reverse-network breadth-first search, global IDs.
+  ! Each reservoir is a barrier to backwater from a DIFFERENT dam. Walking
+  ! stops where the upstream channel bed reaches the imposed water level.
+  ! Zero/-9/invalid downstream pointers are never dereferenced. Cycle safe.
+  subroutine HYMAP3_coldstart_upstream_stages(ng,next,bed,nres,dams, &
+       targets,valid,levels)
+    implicit none
+    integer, intent(in) :: ng,nres,next(ng),dams(nres)
+    real, intent(in) :: bed(ng)
+    real*8, intent(in) :: targets(nres)
+    logical, intent(in) :: valid(nres)
+    real*8, intent(out) :: levels(ng)
+    integer, allocatable :: head(:),link(:),queue(:),seen(:)
+    logical, allocatable :: is_dam(:)
+    integer :: j,down,r,start,stop,up,cell,root
+    allocate(head(ng),link(ng),queue(ng),seen(ng),is_dam(ng))
+    head=0
+    link=0
+    seen=0
+    is_dam=.false.
+    levels=-huge(1.d0)
+    do j=1,nres
+       if(dams(j)>=1.and.dams(j)<=ng)is_dam(dams(j))=.true.
+    enddo
+    do j=1,ng
+       down=next(j)
+       if(down<1.or.down>ng.or.down==j)cycle
+       link(j)=head(down)
+       head(down)=j
+    enddo
+    do r=1,nres
+       if(.not.valid(r))cycle
+       root=dams(r)
+       if(root<1.or.root>ng)cycle
+       if(dble(bed(root))>=targets(r))cycle
+       start=1
+       stop=1
+       queue(stop)=root
+       seen(root)=r
+       do while(start<=stop)
+          cell=queue(start)
+          start=start+1
+          levels(cell)=max(levels(cell),targets(r))
+          up=head(cell)
+          do while(up/=0)
+             ! Do not cross an upstream dam or a dry channel divide.
+             if(seen(up)/=r.and..not.is_dam(up))then
+                if(dble(bed(up))<targets(r))then
+                   seen(up)=r
+                   stop=stop+1
+                   queue(stop)=up
+                endif
+             endif
+             up=link(up)
+          enddo
+       enddo
+    enddo
+    deallocate(head,link,queue,seen,is_dam)
+  end subroutine HYMAP3_coldstart_upstream_stages
+
   !BOP
   !
   ! !ROUTINE: HYMAP3_gather_tiles
@@ -3839,12 +4436,21 @@ contains
     integer        :: status
 
 #if (defined SPMD)
+    external :: MPI_ALLGATHERV
+#endif
+
+#if (defined SPMD)
     call MPI_ALLGATHERV(var,&
          LIS_rc%nroutinggrid(n),&
-         MPI_REAL,tmpvar,&
+         ! MPI_REAL,tmpvar,&
+         MPI_INTEGER,tmpvar,&
          LIS_routing_gdeltas(n,:),&
          LIS_routing_goffsets(n,:),&
-         MPI_REAL,LIS_mpi_comm,status)
+         ! MPI_REAL,LIS_mpi_comm,status)
+         MPI_INTEGER,LIS_mpi_comm,status)
+#else
+    ! An identity copy provides the serial equivalent of MPI_ALLGATHERV.
+    tmpvar(1:LIS_rc%nroutinggrid(n))=var
 #endif
     !rearrange them to be in correct order.
     do l=1,LIS_npes
@@ -3861,6 +4467,785 @@ contains
     enddo
 
   end subroutine HYMAP3_gather_tiles_int
+! ================================================================
+!ag (21Nov2026) Network MPI: New network-aware MPI communication layer.
+! Retain the original HYMAP3_gather_tiles / HYMAP3_map_g2l below unchanged.
+! Every cross-processor channel edge is determined ONCE at initialization.
+! A global index and its owner/local index must be unambiguous.
+! ================================================================
+  subroutine HYMAP3_network_build(n)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_routingMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    integer :: ng, nl, rank, np, p, k, gid, gd, ix, iy, idx
+    integer :: sr, dr, loc, j
+    integer, allocatable :: adj_pos(:),cursor_out(:),cursor_in(:)
+
+    ng=LIS_rc%glbnroutinggrid(n)
+    nl=LIS_rc%nroutinggrid(n)
+    rank=LIS_localPet
+    np=LIS_npes
+    associate(plan => HYMAP3_routing_struc(n)%network)
+      allocate(plan%owner(ng),plan%gl2local(ng),plan%local2gl(nl))
+      allocate(plan%out_count(0:np-1),plan%in_count(0:np-1))
+      allocate(plan%out_off(0:np),plan%in_off(0:np))
+      allocate(plan%remote_down_slot(nl),plan%remote_up_slot(ng))
+      plan%owner=-1
+      plan%gl2local=0
+      plan%local2gl=0
+      plan%out_count=0
+      plan%in_count=0
+      plan%remote_down_slot=0
+      plan%remote_up_slot=0
+
+      ! Rebuild the global-index-to-owner table once from LIS' existing
+      ! rank-order sequence. The full arrays are NOT gathered per timestep.
+      do p=0,np-1
+         do k=1,LIS_routing_gdeltas(n,p)
+            idx=k+LIS_routing_goffsets(n,p)
+            ix=HYMAP3_routing_struc(n)%seqx_glb(idx)+ &
+                 LIS_ews_halo_ind(n,p+1)-1
+            iy=HYMAP3_routing_struc(n)%seqy_glb(idx)+ &
+                 LIS_nss_halo_ind(n,p+1)-1
+            if(ix<1.or.ix>LIS_rc%gnc(n).or. &
+                 iy<1.or.iy>LIS_rc%gnr(n))then
+               write(LIS_logunit,*) '[ERR] network MPI: grid coordinates outside domain',p,k,ix,iy
+               call LIS_endrun()
+            endif
+            gid=HYMAP3_routing_struc(n)%sindex(ix,iy)
+            if(gid<1.or.gid>ng)then
+               write(LIS_logunit,*) '[ERR] network MPI: invalid global river index',p,k,gid
+               call LIS_endrun()
+            endif
+            if(plan%owner(gid)/=-1)then
+               write(LIS_logunit,*) '[ERR] network MPI: duplicate river ownership',gid
+               call LIS_endrun()
+            endif
+            plan%owner(gid)=p
+            plan%gl2local(gid)=k
+            if(p==rank)plan%local2gl(k)=gid
+         enddo
+      enddo
+      if(any(plan%owner<0).or.any(plan%local2gl<1))then
+         write(LIS_logunit,*) '[ERR] network MPI: incomplete LIS ownership mapping'
+         call LIS_endrun()
+      endif
+
+      ! Build two opposite exchange schedules for every remote edge:
+      !   OUT: local upstream -> remote downstream (discharge send),
+      !        remote downstream -> local upstream (state receive)
+      !   IN:  remote upstream -> local downstream (discharge receive),
+      !        local downstream -> remote upstream (state send).
+      do gid=1,ng
+         if(HYMAP3_routing_struc(n)%outlet_glb(gid)/=0)cycle
+         gd=HYMAP3_routing_struc(n)%next_glb(gid)
+         if(gd<1.or.gd>ng)then
+            write(LIS_logunit,*) '[ERR] network MPI: invalid downstream river ID',gid,gd
+            call LIS_endrun()
+         endif
+         sr=plan%owner(gid)
+         dr=plan%owner(gd)
+         if(sr==dr)cycle
+         if(sr==rank)plan%out_count(dr)=plan%out_count(dr)+1
+         if(dr==rank)plan%in_count(sr)=plan%in_count(sr)+1
+      enddo
+      plan%out_off(0)=0
+      plan%in_off(0)=0
+      do p=0,np-1
+         plan%out_off(p+1)=plan%out_off(p)+plan%out_count(p)
+         plan%in_off(p+1)=plan%in_off(p)+plan%in_count(p)
+      enddo
+      plan%nout=plan%out_off(np)
+      plan%nin=plan%in_off(np)
+      allocate(plan%out_src_local(plan%nout))
+      allocate(plan%in_src_global(plan%nin),plan%in_dst_local(plan%nin))
+      !ag (21Nov2026) Network MPI: O(Nriver+Ncross) plan construction.
+      ! Traverse global sources once and append to each peer bucket;
+      ! this produces the same global-source order on BOTH MPI ranks.
+      allocate(cursor_out(0:np-1),cursor_in(0:np-1))
+      cursor_out=plan%out_off(0:np-1)
+      cursor_in=plan%in_off(0:np-1)
+      do gid=1,ng
+         if(HYMAP3_routing_struc(n)%outlet_glb(gid)/=0)cycle
+         gd=HYMAP3_routing_struc(n)%next_glb(gid)
+         sr=plan%owner(gid)
+         dr=plan%owner(gd)
+         if(sr==dr)cycle
+         if(sr==rank)then
+            cursor_out(dr)=cursor_out(dr)+1
+            j=cursor_out(dr)
+            loc=plan%gl2local(gid)
+            plan%out_src_local(j)=loc
+            plan%remote_down_slot(loc)=j
+         endif
+         if(dr==rank)then
+            cursor_in(sr)=cursor_in(sr)+1
+            j=cursor_in(sr)
+            plan%in_src_global(j)=gid
+            plan%in_dst_local(j)=plan%gl2local(gd)
+            plan%remote_up_slot(gid)=j
+         endif
+      enddo
+      deallocate(cursor_out,cursor_in)
+      ! CSR upstream-neighbor list, sorted by GLOBAL SOURCE index. Every
+      ! tributary is represented; this preserves the addition order of the
+      ! legacy global loop, including locally owned and remote tributaries.
+      allocate(plan%up_ptr(nl+1))
+      plan%up_ptr=0
+      do gid=1,ng
+         if(HYMAP3_routing_struc(n)%outlet_glb(gid)/=0)cycle
+         gd=HYMAP3_routing_struc(n)%next_glb(gid)
+         if(plan%owner(gd)==rank)then
+            loc=plan%gl2local(gd)
+            plan%up_ptr(loc+1)=plan%up_ptr(loc+1)+1
+         endif
+      enddo
+      do k=1,nl
+         plan%up_ptr(k+1)=plan%up_ptr(k+1)+plan%up_ptr(k)
+      enddo
+      allocate(plan%up_global(plan%up_ptr(nl+1)),adj_pos(nl))
+      adj_pos=plan%up_ptr(1:nl)
+      do gid=1,ng
+         if(HYMAP3_routing_struc(n)%outlet_glb(gid)/=0)cycle
+         gd=HYMAP3_routing_struc(n)%next_glb(gid)
+         if(plan%owner(gd)==rank)then
+            loc=plan%gl2local(gd)
+            adj_pos(loc)=adj_pos(loc)+1
+            plan%up_global(adj_pos(loc))=gid
+         endif
+      enddo
+      deallocate(adj_pos)
+      ! LIS_npes ranks and allocated state/flux communication buffers.
+      ! The same peer order is now cached and buffers reused; no change
+      ! to MPI tags, payload, traversal, or floating-point evaluation.
+      allocate(plan%out_peer(count(plan%out_count>0)))
+      allocate(plan%in_peer(count(plan%in_count>0)))
+      j=0
+      k=0
+      do p=0,np-1
+         if(plan%out_count(p)>0)then
+            j=j+1
+            plan%out_peer(j)=p
+         endif
+         if(plan%in_count(p)>0)then
+            k=k+1
+            plan%in_peer(k)=p
+         endif
+      enddo
+      allocate(plan%state_sendbuf(8,plan%nin))
+      allocate(plan%flux_sendbuf(2,plan%nout))
+      allocate(plan%flux_recvbuf(2,plan%nin))
+      allocate(plan%depth_old_riv(nl),plan%depth_old_fld(nl))
+      allocate(plan%down_halo(8,plan%nout))
+      plan%initialized=.true.
+      write(LIS_logunit,*) '[INFO] HYMAP3 network MPI rank/outgoing/incoming',rank, &
+           plan%nout,plan%nin
+    end associate
+  end subroutine HYMAP3_network_build
+
+!ag (21Nov2026) Network MPI phase 2:
+! Build one deterministic, ownership-sorted list of operator grid cells.
+! This uses global indices only at initialization, NEVER a timestep gather.
+! It includes arbitrary bifurcation links (not only NEXT_GLB links),
+! reservoir dam/downstream pairs, management diversions, and gauge sites.
+  subroutine HYMAP3_network_build_operator_map(n)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    integer :: ng, p, i, k, gid, gd
+    integer, allocatable :: cursor(:)
+    logical, allocatable :: touched(:)
+    ng=LIS_rc%glbnroutinggrid(n)
+    associate(plan => HYMAP3_routing_struc(n)%network)
+      if(.not.plan%initialized)then
+         write(LIS_logunit,*) '[ERR] network MPI: operator map needs river map'
+         call LIS_endrun()
+      endif
+      allocate(touched(ng),plan%op_count(0:LIS_npes-1))
+      allocate(plan%op_off(0:LIS_npes))
+      touched=.false.
+      plan%op_count=0
+      if(HYMAP3_routing_struc(n)%bifflag==1)then
+         do i=1,HYMAP3_routing_struc(n)%nbif
+            call mark(HYMAP3_routing_struc(n)%bifloc(i,1),'bif source')
+            call mark(HYMAP3_routing_struc(n)%bifloc(i,2),'bif target')
+         enddo
+      endif
+      if(HYMAP3_routing_struc(n)%resopflag>0)then
+         do i=1,HYMAP3_routing_struc(n)%nresop
+            call mark(HYMAP3_routing_struc(n)%resoploc_glb(i),'dam')
+            call mark(HYMAP3_routing_struc(n)%resoploc_dwn_glb(i),'dam downstream')
+         enddo
+      endif
+      if(HYMAP3_routing_struc(n)%managflag==1)then
+         do i=1,HYMAP3_routing_struc(n)%nmanag
+            gid=HYMAP3_routing_struc(n)%managloc(i,1)
+            call mark(gid,'management source')
+            call mark(HYMAP3_routing_struc(n)%managloc(i,2),'management diversion')
+            if(gid>=1.and.gid<=ng)then
+               call mark(HYMAP3_routing_struc(n)%next_glb(gid),'management downstream')
+            endif
+         enddo
+      endif
+      if(HYMAP3_routing_struc(n)%insertflag==1)then
+         do i=1,HYMAP3_routing_struc(n)%ninsert
+            gid=HYMAP3_routing_struc(n)%insertloc(i)
+            call mark(gid,'gauge source')
+            if(gid>=1.and.gid<=ng)then
+               call mark(HYMAP3_routing_struc(n)%next_glb(gid),'gauge downstream')
+            endif
+         enddo
+      endif
+      do gid=1,ng
+         if(touched(gid))plan%op_count(plan%owner(gid))= &
+              plan%op_count(plan%owner(gid))+1
+      enddo
+      plan%op_off(0)=0
+      do p=0,LIS_npes-1
+         plan%op_off(p+1)=plan%op_off(p)+plan%op_count(p)
+      enddo
+      plan%noperator=plan%op_off(LIS_npes)
+      allocate(plan%op_gid(plan%noperator),cursor(0:LIS_npes-1))
+      cursor=plan%op_off(0:LIS_npes-1)
+      do gid=1,ng
+         if(.not.touched(gid))cycle
+         p=plan%owner(gid)
+         cursor(p)=cursor(p)+1
+         plan%op_gid(cursor(p))=gid
+      enddo
+      write(LIS_logunit,*) '[INFO] HYMAP3 network MPI operator cells/rank', &
+           plan%noperator,LIS_localPet,plan%op_count(LIS_localPet)
+      deallocate(cursor,touched)
+    end associate
+  contains
+    subroutine mark(idx,kind)
+      integer, intent(in) :: idx
+      character(*), intent(in) :: kind
+      if(idx<1.or.idx>ng)then
+         write(LIS_logunit,*) '[ERR] network MPI: invalid operator location', &
+              trim(kind),idx,ng
+         call LIS_endrun()
+      endif
+      touched(idx)=.true.
+    end subroutine mark
+  end subroutine HYMAP3_network_build_operator_map
+
+!ag (21Nov2026) Network MPI phase 2: Gather ONLY operator cells from the
+! owning ranks to root 0. No full-grid gathers and no all-rank reductions.
+! The 11 fields exactly preserve all inputs used by the legacy operators.
+! Order: rivelv,rivdph,rivdph_pre,rivsto,fldsto,runoff,sfcelv,
+!        rivout,fldout,rivinf,fldinf.
+  subroutine HYMAP3_network_operator_gather(n,rivelv,rivdph,rivdph_pre, &
+       rivsto,fldsto,runoff,sfcelv,rivout,fldout,rivinf,fldinf,states)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    real, intent(in) :: rivelv(:),rivdph(:),rivdph_pre(:),rivsto(:),fldsto(:)
+    real, intent(in) :: runoff(:),sfcelv(:),rivout(:),fldout(:),rivinf(:),fldinf(:)
+    real, intent(out) :: states(:,:)
+    real, allocatable :: sendbuf(:,:)
+    integer :: p, k, loc, idx, nr
+#if (defined SPMD)
+    integer :: ierr
+    integer :: req(max(1,LIS_npes))
+    integer :: statuses(MPI_STATUS_SIZE,max(1,LIS_npes))
+    external :: MPI_IRECV, MPI_ISEND, MPI_WAITALL
+#endif
+    associate(plan => HYMAP3_routing_struc(n)%network)
+      if(size(states,1)/=11.or.size(states,2)/=plan%noperator)then
+         write(LIS_logunit,*) '[ERR] network MPI: operator receive shape mismatch'
+         call LIS_endrun()
+      endif
+      nr=0
+#if (defined SPMD)
+      if(LIS_localPet==0)then
+         do p=1,LIS_npes-1
+            if(plan%op_count(p)==0)cycle
+            nr=nr+1
+            call MPI_IRECV(states(1,plan%op_off(p)+1), &
+                 11*plan%op_count(p),MPI_REAL,p,22530,LIS_mpi_comm,req(nr),ierr)
+            if(ierr/=MPI_SUCCESS)call LIS_endrun()
+         enddo
+      endif
+#endif
+      allocate(sendbuf(11,plan%op_count(LIS_localPet)))
+      do k=1,plan%op_count(LIS_localPet)
+         idx=plan%op_off(LIS_localPet)+k
+         loc=plan%gl2local(plan%op_gid(idx))
+         sendbuf(:,k)=(/rivelv(loc),rivdph(loc),rivdph_pre(loc), &
+              rivsto(loc),fldsto(loc),runoff(loc),sfcelv(loc), &
+              rivout(loc),fldout(loc),rivinf(loc),fldinf(loc)/)
+      enddo
+      if(LIS_localPet==0)then
+         if(plan%op_count(0)>0)states(:,1:plan%op_count(0))=sendbuf
+      else
+#if (defined SPMD)
+         if(plan%op_count(LIS_localPet)>0)then
+            nr=1
+            call MPI_ISEND(sendbuf,11*plan%op_count(LIS_localPet), &
+                 MPI_REAL,0,22530,LIS_mpi_comm,req(nr),ierr)
+            if(ierr/=MPI_SUCCESS)call LIS_endrun()
+         endif
+#endif
+      endif
+#if (defined SPMD)
+      if(nr>0)then
+         call MPI_WAITALL(nr,req,statuses,ierr)
+         if(ierr/=MPI_SUCCESS)call LIS_endrun()
+      endif
+#endif
+      deallocate(sendbuf)
+    end associate
+  end subroutine HYMAP3_network_operator_gather
+
+!ag (21Nov2026) Network MPI phase 2: Root sends four *final* flow fields
+! back ONLY to the owners of affected cells. All optional operators run
+! on root in the historical sequence, so common destinations, cascade
+! reservoirs, and multiple bifurcations retain legacy ordering.
+  subroutine HYMAP3_network_operator_scatter(n, &
+       rivout_global,fldout_global,rivinf_global,fldinf_global, &
+       rivout,fldout,rivinf,fldinf)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    !ag (21Nov2026) Network MPI phase 2: These global arrays are
+    ! allocated ONLY on root. An ALLOCATABLE dummy permits the other
+    ! ranks to pass their unallocated actual arrays safely.
+    real, allocatable, intent(in) :: rivout_global(:),fldout_global(:)
+    real, allocatable, intent(in) :: rivinf_global(:),fldinf_global(:)
+    real, intent(inout) :: rivout(:),fldout(:),rivinf(:),fldinf(:)
+    real, allocatable :: packet(:,:)
+    integer :: p,k,loc,gid,idx,nr
+#if (defined SPMD)
+    integer :: ierr
+    integer :: req(max(1,LIS_npes))
+    integer :: statuses(MPI_STATUS_SIZE,max(1,LIS_npes))
+    external :: MPI_IRECV,MPI_ISEND,MPI_WAITALL
+#endif
+    associate(plan => HYMAP3_routing_struc(n)%network)
+      nr=0
+      if(LIS_localPet==0)then
+         allocate(packet(4,plan%noperator))
+         do k=1,plan%noperator
+            gid=plan%op_gid(k)
+            packet(:,k)=(/rivout_global(gid),fldout_global(gid), &
+                 rivinf_global(gid),fldinf_global(gid)/)
+         enddo
+#if (defined SPMD)
+         do p=1,LIS_npes-1
+            if(plan%op_count(p)==0)cycle
+            nr=nr+1
+            call MPI_ISEND(packet(1,plan%op_off(p)+1), &
+                 4*plan%op_count(p),MPI_REAL,p,22531,LIS_mpi_comm,req(nr),ierr)
+            if(ierr/=MPI_SUCCESS)call LIS_endrun()
+         enddo
+#endif
+      else
+         allocate(packet(4,plan%op_count(LIS_localPet)))
+#if (defined SPMD)
+         if(plan%op_count(LIS_localPet)>0)then
+            nr=1
+            call MPI_IRECV(packet,4*plan%op_count(LIS_localPet), &
+                 MPI_REAL,0,22531,LIS_mpi_comm,req(nr),ierr)
+            if(ierr/=MPI_SUCCESS)call LIS_endrun()
+         endif
+#endif
+      endif
+#if (defined SPMD)
+      if(nr>0)then
+         call MPI_WAITALL(nr,req,statuses,ierr)
+         if(ierr/=MPI_SUCCESS)call LIS_endrun()
+      endif
+#endif
+      do k=1,plan%op_count(LIS_localPet)
+         idx=plan%op_off(LIS_localPet)+k
+         loc=plan%gl2local(plan%op_gid(idx))
+         if(LIS_localPet==0)then
+            rivout(loc)=packet(1,idx)
+            fldout(loc)=packet(2,idx)
+            rivinf(loc)=packet(3,idx)
+            fldinf(loc)=packet(4,idx)
+         else
+            rivout(loc)=packet(1,k)
+            fldout(loc)=packet(2,k)
+            rivinf(loc)=packet(3,k)
+            fldinf(loc)=packet(4,k)
+         endif
+      enddo
+      deallocate(packet)
+    end associate
+  end subroutine HYMAP3_network_operator_scatter
+
+!ag (21Nov2026) Network MPI: Exchange downstream hydraulic state upstream.
+! Each remote edge carries eight reals in the same order as the legacy
+! downstream lookup. Nonblocking peer messages avoid ordering deadlocks.
+  subroutine HYMAP3_network_exchange_downstates(n,rivelv,rivsto,rivdph, &
+       rivdph_pre,fldelv1,fldsto,flddph1,flddph_pre,halo)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    real, intent(in) :: rivelv(:),rivsto(:),rivdph(:),rivdph_pre(:)
+    real, intent(in) :: fldelv1(:),fldsto(:),flddph1(:),flddph_pre(:)
+    real, intent(out) :: halo(:,:)
+    ! Message workspace now belongs to the per-nest network plan.
+    integer :: k, loc, p, ipeer
+#if (defined SPMD)
+    integer :: ierr, nr
+    integer :: req(2*LIS_npes)
+    integer :: statuses(MPI_STATUS_SIZE,2*LIS_npes)
+    external :: MPI_IRECV, MPI_ISEND, MPI_WAITALL
+#endif
+    associate(plan => HYMAP3_routing_struc(n)%network)
+      if(.not.plan%initialized.or.size(halo,2)/=plan%nout.or. &
+           size(halo,1)/=8)then
+         write(LIS_logunit,*) '[ERR] HYMAP3 network MPI: bad downstream halo',LIS_localPet
+         call LIS_endrun()
+      endif
+      do k=1,plan%nin
+         loc=plan%in_dst_local(k)
+         plan%state_sendbuf(:,k)=(/rivelv(loc),rivsto(loc),rivdph(loc), &
+              rivdph_pre(loc),fldelv1(loc),fldsto(loc), &
+              flddph1(loc),flddph_pre(loc)/)
+      enddo
+#if (defined SPMD)
+      nr=0
+      do ipeer=1,size(plan%out_peer)
+         p=plan%out_peer(ipeer)
+         nr=nr+1
+         call MPI_IRECV(halo(1,plan%out_off(p)+1), &
+              8*plan%out_count(p),MPI_REAL,p,22510,LIS_mpi_comm,req(nr),ierr)
+         if(ierr/=MPI_SUCCESS)then
+            write(LIS_logunit,*) '[ERR] HYMAP3 network MPI: IRECV state failed',LIS_localPet,ierr
+            call LIS_endrun()
+         endif
+      enddo
+      do ipeer=1,size(plan%in_peer)
+         p=plan%in_peer(ipeer)
+         nr=nr+1
+         call MPI_ISEND(plan%state_sendbuf(1,plan%in_off(p)+1), &
+              8*plan%in_count(p),MPI_REAL,p,22510,LIS_mpi_comm,req(nr),ierr)
+         if(ierr/=MPI_SUCCESS)then
+            write(LIS_logunit,*) '[ERR] HYMAP3 network MPI: ISEND state failed',LIS_localPet,ierr
+            call LIS_endrun()
+         endif
+      enddo
+      if(nr>0)then
+         call MPI_WAITALL(nr,req,statuses,ierr)
+         if(ierr/=MPI_SUCCESS)then
+            write(LIS_logunit,*) '[ERR] HYMAP3 network MPI: WAITALL state failed',LIS_localPet,ierr
+            call LIS_endrun()
+         endif
+      endif
+#endif
+    end associate
+  end subroutine HYMAP3_network_exchange_downstates
+
+!ag (21Nov2026) Network MPI: Send upstream river and floodplain outflows
+! forward; reconstruct downstream inflow using ALL upstream tributaries.
+! Importantly, these exchanges are limited to cross-processor river edges.
+  subroutine HYMAP3_network_accumulate_inflows(n,rivout,fldout,rivinf,fldinf)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    real, intent(in) :: rivout(:),fldout(:)
+    real, intent(out) :: rivinf(:),fldinf(:)
+    integer :: k, loc, p, gid, islot, ipeer
+#if (defined SPMD)
+    integer :: ierr, nr
+    integer :: req(2*LIS_npes)
+    integer :: statuses(MPI_STATUS_SIZE,2*LIS_npes)
+    external :: MPI_IRECV, MPI_ISEND, MPI_WAITALL
+#endif
+    associate(plan => HYMAP3_routing_struc(n)%network)
+      if(.not.plan%initialized)then
+         write(LIS_logunit,*) '[ERR] HYMAP3 network MPI: plan not initialized',LIS_localPet
+         call LIS_endrun()
+      endif
+      do k=1,plan%nout
+         loc=plan%out_src_local(k)
+         plan%flux_sendbuf(:,k)=(/rivout(loc),fldout(loc)/)
+      enddo
+#if (defined SPMD)
+      nr=0
+      do ipeer=1,size(plan%in_peer)
+         p=plan%in_peer(ipeer)
+         nr=nr+1
+         call MPI_IRECV(plan%flux_recvbuf(1,plan%in_off(p)+1), &
+              2*plan%in_count(p),MPI_REAL,p,22511,LIS_mpi_comm,req(nr),ierr)
+         if(ierr/=MPI_SUCCESS)then
+            write(LIS_logunit,*) '[ERR] HYMAP3 network MPI: IRECV flux failed',LIS_localPet,ierr
+            call LIS_endrun()
+         endif
+      enddo
+      do ipeer=1,size(plan%out_peer)
+         p=plan%out_peer(ipeer)
+         nr=nr+1
+         call MPI_ISEND(plan%flux_sendbuf(1,plan%out_off(p)+1), &
+              2*plan%out_count(p),MPI_REAL,p,22511,LIS_mpi_comm,req(nr),ierr)
+         if(ierr/=MPI_SUCCESS)then
+            write(LIS_logunit,*) '[ERR] HYMAP3 network MPI: ISEND flux failed',LIS_localPet,ierr
+            call LIS_endrun()
+         endif
+      enddo
+      if(nr>0)then
+         call MPI_WAITALL(nr,req,statuses,ierr)
+         if(ierr/=MPI_SUCCESS)then
+            write(LIS_logunit,*) '[ERR] HYMAP3 network MPI: WAITALL flux failed',LIS_localPet,ierr
+            call LIS_endrun()
+         endif
+      endif
+#endif
+      rivinf=0.
+      fldinf=0.
+      do loc=1,size(rivinf)
+         do k=plan%up_ptr(loc)+1,plan%up_ptr(loc+1)
+            gid=plan%up_global(k)
+            if(plan%owner(gid)==LIS_localPet)then
+               islot=plan%gl2local(gid)
+               rivinf(loc)=rivinf(loc)+rivout(islot)
+               fldinf(loc)=fldinf(loc)+fldout(islot)
+            else
+               islot=plan%remote_up_slot(gid)
+               if(islot<1)then
+                  write(LIS_logunit,*) '[ERR] HYMAP3 network MPI: missing remote tributary', &
+                       LIS_localPet,gid
+                  call LIS_endrun()
+               endif
+               rivinf(loc)=rivinf(loc)+plan%flux_recvbuf(1,islot)
+               fldinf(loc)=fldinf(loc)+plan%flux_recvbuf(2,islot)
+            endif
+         enddo
+      enddo
+    end associate
+  end subroutine HYMAP3_network_accumulate_inflows
+
+!ag (21Nov2026) Urban network MPI:
+! Build the independent urban-drainage edge plan ONCE at initialization.
+! The original urban global loop used NEXT_GLB>0 for every source,
+! including outlet cells; reusing the river-only CSR would silently omit
+! some drainage flows. Source order is ascending GLOBAL river-cell ID.
+  subroutine HYMAP3_network_build_urban(n)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    integer :: ng, nl, np, rank, gid, gd, sr, dr, p, k, j, loc
+    integer, allocatable :: cursor_out(:),cursor_in(:),adj_pos(:)
+
+    ng=LIS_rc%glbnroutinggrid(n)
+    nl=LIS_rc%nroutinggrid(n)
+    np=LIS_npes
+    rank=LIS_localPet
+    associate(plan => HYMAP3_routing_struc(n)%network)
+      if(.not.plan%initialized)then
+         write(LIS_logunit,*) '[ERR] urban network MPI: river owner map absent',rank
+         call LIS_endrun()
+      endif
+      allocate(plan%urban_out_count(0:np-1),plan%urban_in_count(0:np-1))
+      allocate(plan%urban_out_off(0:np),plan%urban_in_off(0:np))
+      plan%urban_out_count=0
+      plan%urban_in_count=0
+      do gid=1,ng
+         gd=HYMAP3_routing_struc(n)%next_glb(gid)
+         if(gd<=0)cycle
+         if(gd>ng)then
+            write(LIS_logunit,*) '[ERR] urban network MPI: invalid NEXT_GLB',gid,gd
+            call LIS_endrun()
+         endif
+         sr=plan%owner(gid)
+         dr=plan%owner(gd)
+         if(sr==dr)cycle
+         if(sr==rank)plan%urban_out_count(dr)=plan%urban_out_count(dr)+1
+         if(dr==rank)plan%urban_in_count(sr)=plan%urban_in_count(sr)+1
+      enddo
+      plan%urban_out_off(0)=0
+      plan%urban_in_off(0)=0
+      do p=0,np-1
+         plan%urban_out_off(p+1)=plan%urban_out_off(p)+plan%urban_out_count(p)
+         plan%urban_in_off(p+1)=plan%urban_in_off(p)+plan%urban_in_count(p)
+      enddo
+      plan%urban_nout=plan%urban_out_off(np)
+      plan%urban_nin=plan%urban_in_off(np)
+      allocate(plan%urban_out_src_local(plan%urban_nout))
+      allocate(plan%urban_in_src_global(plan%urban_nin))
+      allocate(plan%urban_remote_up_slot(ng))
+      plan%urban_remote_up_slot=0
+      allocate(cursor_out(0:np-1),cursor_in(0:np-1))
+      cursor_out=plan%urban_out_off(0:np-1)
+      cursor_in=plan%urban_in_off(0:np-1)
+      do gid=1,ng
+         gd=HYMAP3_routing_struc(n)%next_glb(gid)
+         if(gd<=0)cycle
+         sr=plan%owner(gid)
+         dr=plan%owner(gd)
+         if(sr==dr)cycle
+         if(sr==rank)then
+            cursor_out(dr)=cursor_out(dr)+1
+            j=cursor_out(dr)
+            plan%urban_out_src_local(j)=plan%gl2local(gid)
+         endif
+         if(dr==rank)then
+            cursor_in(sr)=cursor_in(sr)+1
+            j=cursor_in(sr)
+            plan%urban_in_src_global(j)=gid
+            plan%urban_remote_up_slot(gid)=j
+         endif
+      enddo
+      deallocate(cursor_out,cursor_in)
+
+      ! For each locally owned destination, list ALL drainage sources.
+      ! Keeping global source order matches the old root-side summation.
+      allocate(plan%urban_up_ptr(nl+1))
+      plan%urban_up_ptr=0
+      do gid=1,ng
+         gd=HYMAP3_routing_struc(n)%next_glb(gid)
+         if(gd<=0)cycle
+         if(plan%owner(gd)==rank)then
+            loc=plan%gl2local(gd)
+            plan%urban_up_ptr(loc+1)=plan%urban_up_ptr(loc+1)+1
+         endif
+      enddo
+      do k=1,nl
+         plan%urban_up_ptr(k+1)=plan%urban_up_ptr(k+1)+plan%urban_up_ptr(k)
+      enddo
+      allocate(plan%urban_up_global(plan%urban_up_ptr(nl+1)))
+      allocate(adj_pos(nl))
+      adj_pos=plan%urban_up_ptr(1:nl)
+      do gid=1,ng
+         gd=HYMAP3_routing_struc(n)%next_glb(gid)
+         if(gd<=0)cycle
+         if(plan%owner(gd)==rank)then
+            loc=plan%gl2local(gd)
+            adj_pos(loc)=adj_pos(loc)+1
+            plan%urban_up_global(adj_pos(loc))=gid
+         endif
+      enddo
+      deallocate(adj_pos)
+      !ag (22Nov2026) MPI performance: As with the river network, cache the
+      ! communicating ranks and workspaces once, in ascending rank order.
+      allocate(plan%urban_out_peer(count(plan%urban_out_count>0)))
+      allocate(plan%urban_in_peer(count(plan%urban_in_count>0)))
+      j=0
+      k=0
+      do p=0,np-1
+         if(plan%urban_out_count(p)>0)then
+            j=j+1
+            plan%urban_out_peer(j)=p
+         endif
+         if(plan%urban_in_count(p)>0)then
+            k=k+1
+            plan%urban_in_peer(k)=p
+         endif
+      enddo
+      allocate(plan%urban_sendbuf(plan%urban_nout))
+      allocate(plan%urban_recvbuf(plan%urban_nin))
+      plan%urban_initialized=.true.
+      write(LIS_logunit,*) '[INFO] HYMAP3 urban MPI rank/send/receive',rank, &
+           plan%urban_nout,plan%urban_nin
+    end associate
+  end subroutine HYMAP3_network_build_urban
+
+!ag (21Nov2026) Urban network MPI:
+! Exchange ONLY the drainage outflow of source cells whose downstream
+! destination is owned by another MPI rank. The old algorithm gathered
+! every drainage outflow and broadcast full-domain drainage inflow.
+! Routing tributaries are summed in the EXACT global-source order used
+! by the old root loop. Local and cross-rank outlets use the same logic.
+  subroutine HYMAP3_network_accumulate_urban(n,drout,drinf,rivinf)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    real, intent(in) :: drout(:)
+    real, intent(out) :: drinf(:)
+    real, intent(inout) :: rivinf(:)
+    integer :: k, loc, p, gid, islot, ipeer
+    real :: q
+#if (defined SPMD)
+    integer :: ierr, nr
+    integer :: req(2*LIS_npes)
+    integer :: statuses(MPI_STATUS_SIZE,2*LIS_npes)
+    external :: MPI_IRECV,MPI_ISEND,MPI_WAITALL
+#endif
+    associate(plan => HYMAP3_routing_struc(n)%network)
+      if(.not.plan%urban_initialized)then
+         write(LIS_logunit,*) '[ERR] HYMAP3 urban MPI: drainage map absent',LIS_localPet
+         call LIS_endrun()
+      endif
+      do k=1,plan%urban_nout
+         plan%urban_sendbuf(k)=drout(plan%urban_out_src_local(k))
+      enddo
+#if (defined SPMD)
+      nr=0
+      do ipeer=1,size(plan%urban_in_peer)
+         p=plan%urban_in_peer(ipeer)
+         nr=nr+1
+         call MPI_IRECV(plan%urban_recvbuf(plan%urban_in_off(p)+1), &
+              plan%urban_in_count(p),MPI_REAL,p,22512,LIS_mpi_comm,req(nr),ierr)
+         if(ierr/=MPI_SUCCESS)then
+            write(LIS_logunit,*) '[ERR] urban MPI: IRECV failed',LIS_localPet,ierr
+            call LIS_endrun()
+         endif
+      enddo
+      do ipeer=1,size(plan%urban_out_peer)
+         p=plan%urban_out_peer(ipeer)
+         nr=nr+1
+         call MPI_ISEND(plan%urban_sendbuf(plan%urban_out_off(p)+1), &
+              plan%urban_out_count(p),MPI_REAL,p,22512,LIS_mpi_comm,req(nr),ierr)
+         if(ierr/=MPI_SUCCESS)then
+            write(LIS_logunit,*) '[ERR] urban MPI: ISEND failed',LIS_localPet,ierr
+            call LIS_endrun()
+         endif
+      enddo
+      if(nr>0)then
+         call MPI_WAITALL(nr,req,statuses,ierr)
+         if(ierr/=MPI_SUCCESS)then
+            write(LIS_logunit,*) '[ERR] urban MPI: WAITALL failed',LIS_localPet,ierr
+            call LIS_endrun()
+         endif
+      endif
+#endif
+      drinf=0.
+      do loc=1,size(drinf)
+         do k=plan%urban_up_ptr(loc)+1,plan%urban_up_ptr(loc+1)
+            gid=plan%urban_up_global(k)
+            if(plan%owner(gid)==LIS_localPet)then
+               islot=plan%gl2local(gid)
+               q=drout(islot)
+            else
+               islot=plan%urban_remote_up_slot(gid)
+               if(islot<1)then
+                  write(LIS_logunit,*) '[ERR] urban MPI: unmapped drainage source', &
+                       LIS_localPet,gid
+                  call LIS_endrun()
+               endif
+               q=plan%urban_recvbuf(islot)
+            endif
+            if(HYMAP3_routing_struc(n)%droutlet_glb(gid)==0.)then
+               drinf(loc)=drinf(loc)+q
+            else
+               rivinf(loc)=rivinf(loc)+q
+            endif
+         enddo
+      enddo
+    end associate
+  end subroutine HYMAP3_network_accumulate_urban
+
 ! ================================================
 !BOP
 !
@@ -3890,12 +5275,19 @@ contains
     integer        :: status
 
 #if (defined SPMD)
+    external :: MPI_ALLGATHERV
+#endif
+
+#if (defined SPMD)
     call MPI_ALLGATHERV(var,&
          LIS_rc%nroutinggrid(n),&
          MPI_REAL,tmpvar,&
          LIS_routing_gdeltas(n,:),&
          LIS_routing_goffsets(n,:),&
          MPI_REAL,LIS_mpi_comm,status)
+#else
+    ! An identity copy provides the serial equivalent of MPI_ALLGATHERV.
+    tmpvar(1:LIS_rc%nroutinggrid(n))=var
 #endif
   !rearrange them to be in correct order.
     do l=1,LIS_npes
@@ -4013,5 +5405,400 @@ contains
 
   end subroutine HYMAP3_map_l2g_index
 ! ================================================
+
+  !BOP
+  !
+  ! !ROUTINE: HYMAP3_match_points
+  ! \label{HYMAP3_match_points}
+  !
+  ! !DESCRIPTION:
+  !  Performs unique point-to-cell matching ONCE (one point per cell) and
+  !  returns the matched point indices and cell indices in caller-provided
+  !  work arrays (size npts). Only entries 1..nmatch are valid on return.
+  !
+  !  Cells are eligible only when cell_mask(ic) /= miss_val. The domain
+  !  bounding box is computed using ONLY eligible (unmasked) cells.
+  !
+  !  Matching constraints:
+  !    - Point must be inside eligible-cell bbox
+  !    - Distance (deg) <= dist_max_deg
+  !    - Drainage-area similarity: abs(log(Acell/Apt)) <= log(1+area_frac_tol)
+  !
+  !  Objective score minimized:
+  !
+  !EOP
+  subroutine HYMAP3_match_points( &
+       npts, pt_lon, pt_lat, pt_darea, &
+       ncells, cell_lon, cell_lat, cell_darea, &
+       cell_mask, miss_val, &
+       dist_max_deg, area_frac_tol, w_dist, w_area, &
+       nmatch, pt_idx_work, cell_idx_work)
+
+    use LIS_logMod
+    implicit none
+
+    !----------------------------
+    ! Inputs
+    !----------------------------
+    integer, intent(in) :: npts                   ! number of input points to match
+    real*8,  intent(in) :: pt_lon(npts)           ! point longitudes [deg]
+    real*8,  intent(in) :: pt_lat(npts)           ! point latitudes  [deg]
+    real*8,  intent(in) :: pt_darea(npts)         ! point drainage areas (same units as cell_darea)
+
+    integer, intent(in) :: ncells                 ! number of candidate grid cells
+    real*8,  intent(in) :: cell_lon(ncells)       ! cell outlet longitudes [deg]
+    real*8,  intent(in) :: cell_lat(ncells)       ! cell outlet latitudes  [deg]
+    real*8,  intent(in) :: cell_darea(ncells)     ! cell drainage areas (same units as pt_darea)
+
+    integer, intent(in) :: cell_mask(ncells)      ! per-cell mask (miss_val => excluded cell)
+    integer, intent(in) :: miss_val               ! missing value flag (used for mask and point-data missing)
+
+    real*8,  intent(in) :: dist_max_deg           ! max allowed point-cell distance [deg]
+    real*8,  intent(in) :: area_frac_tol          ! fractional area tolerance (0.2 => ±20%)
+    real*8,  intent(in) :: w_dist                 ! score weight for distance term
+    real*8,  intent(in) :: w_area                 ! score weight for log-area mismatch term
+
+    !----------------------------
+    ! Outputs
+    !----------------------------
+    integer, intent(out) :: nmatch                ! number of matched point-cell pairs
+    integer, intent(out) :: pt_idx_work(npts)     ! matched point indices (valid in 1..nmatch)
+    integer, intent(out) :: cell_idx_work(npts)   ! matched cell indices  (valid in 1..nmatch)
+
+    !----------------------------
+    ! Local parameters
+    !----------------------------
+    integer, parameter :: kmax = 8                ! number of candidate cells retained per point
+    real*8,  parameter :: huge_r8 = 1.0d300       ! large number for initialization
+
+    !----------------------------
+    ! Local variables
+    !----------------------------
+    real*8  :: lon_min, lon_max                   ! eligible-cell bbox longitude limits [deg]
+    real*8  :: lat_min, lat_max                   ! eligible-cell bbox latitude  limits [deg]
+    real*8  :: log_area_tol                       ! log-space tolerance = log(1+area_frac_tol)
+
+    integer :: ip, ic                             ! loop indices for points/cells
+    real*8  :: dlon, dlat, ddeg                   ! lon/lat deltas and planar distance [deg]
+    real*8  :: la                                 ! abs(log(Acell/Apt))
+    real*8  :: score                              ! candidate match score
+    logical :: valid_pt                           ! point has valid lon/lat/area
+    logical :: in_domain                          ! point lies inside eligible-cell bbox
+
+    integer :: iter, iter_max                     ! conflict-resolution iteration control
+    logical :: changed                            ! any assignment changed in an iteration
+    integer :: pick_ic                            ! candidate cell chosen for current attempt
+    integer :: loser                              ! displaced point index when a cell is stolen
+
+    logical, allocatable :: valid_cell(:)         ! true for eligible/unmasked cells
+
+    integer, allocatable :: cand_cell(:,:)        ! candidate cell indices per point (top-kmax)
+    real*8,  allocatable :: cand_score(:,:)       ! candidate scores per point (top-kmax)
+    integer, allocatable :: cand_n(:)             ! number of stored candidates per point
+    integer, allocatable :: pt_choice(:)          ! current candidate rank being tried per point
+
+    integer, allocatable :: cell_owner(:)         ! cell_owner(ic)=point index owning cell ic (0 if none)
+    real*8,  allocatable :: cell_score(:)         ! best score achieved for each cell (by its owner)
+
+    integer, allocatable :: pt_best_cell(:)       ! assigned cell for each point (0 if none)
+    logical, allocatable :: pt_assigned(:)        ! assignment status for each point
+
+    !----------------------------
+    ! Basic checks
+    !----------------------------
+    if (ncells < 1) then
+      write(LIS_logunit,*) '[ERR] HYMAP3_match_points: ncells < 1.'
+      call LIS_endrun()
+    endif
+
+    if (npts < 1) then
+      nmatch = 0
+      return
+    endif
+
+    if (area_frac_tol < 0.0d0) then
+      write(LIS_logunit,*) '[ERR] HYMAP3_match_points: area_frac_tol < 0.'
+      call LIS_endrun()
+    endif
+
+    log_area_tol = log(1.0d0 + area_frac_tol)
+
+    !----------------------------
+    ! Eligible cells mask and bbox (eligible cells only)
+    !----------------------------
+    allocate(valid_cell(ncells))
+    valid_cell(:) = (cell_mask(:) /= miss_val)
+
+    if (.not. any(valid_cell)) then
+      write(LIS_logunit,*) '[ERR] HYMAP3_match_points: all cells are masked (no eligible cells).'
+      call LIS_endrun()
+    endif
+
+    lon_min = minval(cell_lon, mask=valid_cell)
+    lon_max = maxval(cell_lon, mask=valid_cell)
+    lat_min = minval(cell_lat, mask=valid_cell)
+    lat_max = maxval(cell_lat, mask=valid_cell)
+
+    !----------------------------
+    ! Allocate internal work arrays
+    !----------------------------
+    allocate(cand_cell(npts, kmax), cand_score(npts, kmax), cand_n(npts))
+    allocate(pt_choice(npts))
+    allocate(cell_owner(ncells), cell_score(ncells))
+    allocate(pt_best_cell(npts), pt_assigned(npts))
+
+    cand_n       = 0
+    pt_choice    = 1
+    cell_owner   = 0
+    cell_score   = huge_r8
+    pt_best_cell = 0
+    pt_assigned  = .false.
+
+    !------------------------------------------------------------
+    ! Build candidate lists (top-K by score) for each point
+    !------------------------------------------------------------
+    do ip = 1, npts
+
+      valid_pt = .true.
+      if (pt_lon(ip)   == dble(miss_val)) valid_pt = .false.
+      if (pt_lat(ip)   == dble(miss_val)) valid_pt = .false.
+      if (pt_darea(ip) == dble(miss_val)) valid_pt = .false.
+      if (.not. valid_pt) cycle
+      if (pt_darea(ip) <= 0.0d0) cycle
+
+      in_domain = .true.
+      if (pt_lon(ip) < lon_min) in_domain = .false.
+      if (pt_lon(ip) > lon_max) in_domain = .false.
+      if (pt_lat(ip) < lat_min) in_domain = .false.
+      if (pt_lat(ip) > lat_max) in_domain = .false.
+      if (.not. in_domain) cycle
+
+      do ic = 1, ncells
+
+        if (.not. valid_cell(ic)) cycle
+        if (cell_darea(ic) <= 0.0d0) cycle
+
+        dlon = cell_lon(ic) - pt_lon(ip)
+        dlat = cell_lat(ic) - pt_lat(ip)
+        ddeg = sqrt(dlon*dlon + dlat*dlat)
+        if (ddeg > dist_max_deg) cycle
+
+        la = abs(log(cell_darea(ic) / pt_darea(ip)))
+        if (la > log_area_tol) cycle
+
+        score = w_dist * ddeg + w_area * la
+
+        call HYMAP3_insert_candidate_topk( &
+             ic, score, kmax, cand_n(ip), cand_cell(ip,:), cand_score(ip,:))
+
+      enddo
+
+    enddo
+
+    !------------------------------------------------------------
+    ! Iterative assignment with conflict resolution
+    !------------------------------------------------------------
+    iter     = 0
+    iter_max = npts * (kmax + 2)
+
+    changed = .true.
+    do while (changed)
+
+      changed = .false.
+      iter = iter + 1
+      if (iter > iter_max) exit
+
+      do ip = 1, npts
+
+        if (pt_assigned(ip)) cycle
+        if (cand_n(ip) < 1) cycle
+        if (pt_choice(ip) > cand_n(ip)) cycle
+
+        pick_ic = cand_cell(ip, pt_choice(ip))
+        score   = cand_score(ip, pt_choice(ip))
+
+        if (pick_ic < 1) then
+          pt_choice(ip) = pt_choice(ip) + 1
+          changed = .true.
+          cycle
+        endif
+
+        if (cell_owner(pick_ic) == 0) then
+
+          cell_owner(pick_ic) = ip
+          cell_score(pick_ic) = score
+          pt_best_cell(ip)    = pick_ic
+          pt_assigned(ip)     = .true.
+          changed = .true.
+
+        else if (score < cell_score(pick_ic)) then
+
+          loser = cell_owner(pick_ic)
+
+          cell_owner(pick_ic) = ip
+          cell_score(pick_ic) = score
+          pt_best_cell(ip)    = pick_ic
+          pt_assigned(ip)     = .true.
+
+          pt_assigned(loser)  = .false.
+          pt_best_cell(loser) = 0
+          pt_choice(loser)    = pt_choice(loser) + 1
+
+          changed = .true.
+
+        else
+
+          pt_choice(ip) = pt_choice(ip) + 1
+          changed = .true.
+
+        endif
+
+      enddo
+
+    enddo
+
+    !------------------------------------------------------------
+    ! Pack results into caller work arrays (first nmatch entries)
+    !------------------------------------------------------------
+    nmatch = 0
+    do ip = 1, npts
+      if (pt_assigned(ip)) then
+        nmatch = nmatch + 1
+        pt_idx_work(nmatch)   = ip
+        cell_idx_work(nmatch) = pt_best_cell(ip)
+      endif
+    enddo
+
+    do ip = nmatch+1, npts
+      pt_idx_work(ip)   = 0
+      cell_idx_work(ip) = 0
+    enddo
+
+    deallocate(valid_cell)
+    deallocate(cand_cell, cand_score, cand_n, pt_choice, cell_owner, cell_score, pt_best_cell, pt_assigned)
+
+  end subroutine HYMAP3_match_points
+
+! ================================================
+  !BOP
+  !
+  ! !ROUTINE: HYMAP3_pack_matches
+  ! \label{HYMAP3_pack_matches}
+  !
+  ! !DESCRIPTION:
+  !  Copies the first nmatch entries from work arrays (size nwork) into
+  !  final-sized arrays (size nmatch). Intended usage:
+  !   1) Call HYMAP3_match_points -> returns nmatch and work arrays
+  !   2) Allocate final arrays of size nmatch in calling code
+  !   3) Call HYMAP3_pack_matches to copy indices
+  !
+  ! !REVISION HISTORY:
+  !  25 Jan 2026: Initial version.
+  !
+  !EOP
+  subroutine HYMAP3_pack_matches(nwork, nmatch, pt_idx_work, cell_idx_work, pt_idx, cell_idx)
+
+    use LIS_logMod
+    implicit none
+
+    !----------------------------
+    ! Dummy arguments (inputs)
+    !----------------------------
+    integer, intent(in) :: nwork                 ! size of work arrays (typically npts)
+    integer, intent(in) :: nmatch                ! number of valid matches in work arrays
+    integer, intent(in) :: pt_idx_work(nwork)    ! work point indices (valid in 1..nmatch)
+    integer, intent(in) :: cell_idx_work(nwork)  ! work cell indices  (valid in 1..nmatch)
+
+    !----------------------------
+    ! Dummy arguments (outputs)
+    !----------------------------
+    integer, intent(out) :: pt_idx(nmatch)       ! packed point indices (size nmatch)
+    integer, intent(out) :: cell_idx(nmatch)     ! packed cell indices  (size nmatch)
+
+    !----------------------------
+    ! Local variables
+    !----------------------------
+    integer :: k
+
+    if (nmatch < 0 .or. nmatch > nwork) then
+      write(LIS_logunit,*) '[ERR] HYMAP3_pack_matches: invalid nmatch.'
+      write(LIS_logunit,*) '[ERR] nmatch=', nmatch, ' nwork=', nwork
+      call LIS_endrun()
+    endif
+
+    do k = 1, nmatch
+      pt_idx(k)   = pt_idx_work(k)
+      cell_idx(k) = cell_idx_work(k)
+    enddo
+
+  end subroutine HYMAP3_pack_matches
+
+! ================================================
+  !BOP
+  !
+  ! !ROUTINE: HYMAP3_insert_candidate_topk
+  ! \label{HYMAP3_insert_candidate_topk}
+  !
+  ! !DESCRIPTION:
+  !  Inserts (cell_id, score) into an in-place top-K list sorted by
+  !  ascending score. Drops candidate if list is full and candidate score
+  !  is worse than the current Kth.
+  !
+  ! !REVISION HISTORY:
+  !  25 Jan 2026: Initial version.
+  !
+  !EOP
+  subroutine HYMAP3_insert_candidate_topk(cell_id, score, kmax, ncur, cells, scores)
+
+    implicit none
+
+    ! Inputs
+    integer, intent(in) :: cell_id              ! candidate cell index
+    real*8,  intent(in) :: score                ! candidate score
+    integer, intent(in) :: kmax                 ! max list length
+
+    ! In/out
+    integer, intent(inout) :: ncur              ! current number of stored candidates
+    integer, intent(inout) :: cells(kmax)       ! candidate cell indices (sorted by score)
+    real*8,  intent(inout) :: scores(kmax)      ! candidate scores (ascending)
+
+    ! Locals
+    integer :: j, pos
+    integer :: tmpc
+    real*8  :: tmps
+
+    if (ncur == 0) then
+      ncur = 1
+      cells(1)  = cell_id
+      scores(1) = score
+      return
+    endif
+
+    if (ncur < kmax) then
+      ncur = ncur + 1
+      cells(ncur)  = cell_id
+      scores(ncur) = score
+    else
+      if (score >= scores(kmax)) return
+      cells(kmax)  = cell_id
+      scores(kmax) = score
+    endif
+
+    pos = ncur
+    do j = ncur-1, 1, -1
+      if (scores(pos) >= scores(j)) exit
+
+      tmps = scores(j)
+      scores(j) = scores(pos)
+      scores(pos) = tmps
+
+      tmpc = cells(j)
+      cells(j) = cells(pos)
+      cells(pos) = tmpc
+
+      pos = j
+    enddo
+
+  end subroutine HYMAP3_insert_candidate_topk
 
 end module HYMAP3_routingMod

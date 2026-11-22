@@ -701,6 +701,10 @@ subroutine HYMAP3_writevar_restart(ftn, n, var, varid)
   integer           :: l,i,ix,iy,ix1,iy1
   integer :: ierr
 
+#if (defined SPMD)
+  external :: MPI_GATHERV
+#endif
+
   if(LIS_masterproc) then
      allocate(gtmp(LIS_rc%glbnroutinggrid(n)))
      allocate(gtmp1(LIS_rc%glbnroutinggrid(n)))
@@ -784,6 +788,10 @@ subroutine HYMAP3_writevar_restart_ens(ftn, n, var, varid)
   integer           :: m
   integer           :: l,i,ix,iy,ix1,iy1
   integer :: ierr
+
+#if (defined SPMD)
+  external :: MPI_GATHERV
+#endif
 
   if(LIS_masterproc) then
      allocate(gtmp(LIS_rc%glbnroutinggrid(n)*LIS_rc%nensem(n)))

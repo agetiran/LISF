@@ -34,7 +34,7 @@ contains
        maxsto, inidis, inisto, dwndis, deadis,                       &
        minsto_mo, nupsto_mo, uppsto_mo,                              &
        mindis_mo, nupdis_mo, uppdis_mo,                              &
-       reg1, reg2, reg3,                                             &
+       ncurve,elev_curve,vol_curve,                                  &
        outflow, inflow_down)
 
     use LIS_logMod
@@ -61,11 +61,11 @@ contains
     real*8,  intent(in)    :: mindis_mo(12)       !Monthly min release (m3 s-1)
     real*8,  intent(in)    :: nupdis_mo(12)       !Monthly normal upper release (m3 s-1)
     real*8,  intent(in)    :: uppdis_mo(12)       !Monthly upper release (m3 s-1)
-    real*8,  intent(in)    :: reg1                !Polynomial equation coef. a (y=ax^2 + bx +c)
-    real*8,  intent(in)    :: reg2                !Polynomial equation coef. b (y=ax^2 + bx +c)
-    real*8,  intent(in)    :: reg3                !Polynomial equation coef. c (y=ax^2 + bx +c)
-    real,    intent(inout) :: outflow              !grid cell outflow (river+floodplain) [m3/s]
-    real,    intent(inout) :: inflow_down              !downstream grid cell inflow [m3/s]
+    integer, intent(in)    :: ncurve              !Number of points in the elevation x volume (ExV) curve
+    real*8,  intent(in)    :: elev_curve(ncurve)  !Elevation in the ExV curve [m]
+    real*8,  intent(in)    :: vol_curve(ncurve)   !Volume in the ExV curve [m3]
+    real,    intent(inout) :: outflow             !grid cell outflow (river+floodplain) [m3/s]
+    real,    intent(inout) :: inflow_down         !downstream grid cell inflow [m3/s]
 
     real*8                 :: volsim
     real                   :: outsim
@@ -74,21 +74,39 @@ contains
     real*8                 :: sfcelv
     integer                :: imon
 
+    real*8                 :: elvmin
+    real*8                 :: elvmax
+    real                   :: bottom
+
     sfcelv=dble(sfcelv1*1d4)/1d4
     Rx=0.
 
-    imon=mod(int(time),1000)/100
-    volsim=max(0.,rivsto+fldsto+(inflow+runoff)*dble(dt))
-    volres = max(0.,(reg1 * sfcelv**2 + reg2 * sfcelv + reg3)) !/ maxsto
+    !if elevation is below minimum, outflow is 10% of min discharge
+    !this avoids the use of polynomial equation beyond elevations used in the calibration
+    elvmin=minval(elev_curve)
+    elvmax=maxval(elev_curve)
+    bottom=elvmin-(elvmax-elvmin)*.1
+    if(sfcelv<bottom)then
+      outsim=0.
+      goto 1
+    endif
 
+    imon=mod(int(time),1000)/100
+    !compute current volume in dam grid cell
+    volsim=max(0.,rivsto+fldsto+(inflow+runoff)*dble(dt))
+    !compute reservoir volume based on ExV curve
+    call HYMAP3_sfcelv_to_vol_linear(elev_curve, vol_curve, ncurve, sfcelv, volres)
+
+    !compute reservoir outflow as a function of reservoir volume using Yassin's scheme
     call SIMRES15(dble(inflow),volres,deadis,maxsto,dwndis, &
          (minsto_mo(imon)/maxsto),&
          (nupsto_mo(imon)/maxsto),(uppsto_mo(imon)/maxsto), &
          mindis_mo(imon),&
          nupdis_mo(imon),uppdis_mo(imon),Rx,dble(dt),outsim)
 
+    if(volres-outsim*dt>maxsto)outsim=(volres-maxsto)/dt
     if(outsim*dt>volsim)outsim=volsim/dt
-    write(LIS_logunit,*) int(time),volsim,volres,sfcelv,outsim
+1   continue
     !update HyMAP variables
     inflow_down=inflow_down-outflow+outsim
     outflow=outsim
@@ -150,6 +168,7 @@ contains
        flowSIM = flowSIM + ((stoSIM - smax)/dt)
        stoSIM = smax
     end if
+    flowSIM = max(min(flowSIM,1e4),0.)
 
   end subroutine SIMRES15
   !=============================================
@@ -189,5 +208,102 @@ contains
 
   end function S2Q1JAN
   !=============================================
+  subroutine HYMAP3_sfcelv_to_vol_linear(elev_curve, vol_curve, ncurve, sfcelv, vol_out)
+    ! Converts simulated water surface elevation (sfcelv) to storage volume (vol_out)
+    ! using a monotonic elevation-volume curve via linear interpolation/extrapolation.
+
+    use LIS_logMod
+
+    implicit none
+
+    ! Inputs
+    integer, intent(in) :: ncurve
+    real*8,  intent(in) :: elev_curve(:)
+    real*8,  intent(in) :: vol_curve(:)
+    real*8,  intent(in) :: sfcelv
+
+    ! Output
+    real*8,  intent(out) :: vol_out
+
+    integer :: klo, khi, kmid
+    real*8  :: x0, x1, y0, y1, frac
+
+    !--------------------------
+    ! Case 0: empty curve (fatal)
+    !--------------------------
+    if (ncurve < 1) then
+      write(LIS_logunit,*) '[ERR] HYMAP3_sfcelv_to_vol_linear: ncurve < 1 (empty curve).'
+      write(LIS_logunit,*) '[ERR] HYMAP3_sfcelv_to_vol_linear: cannot map sfcelv -> volume.'
+      call LIS_endrun()
+      return
+    !--------------------------
+    ! Case 1: single-point curve
+    !--------------------------
+    elseif (ncurve == 1) then
+      vol_out = vol_curve(1)
+
+    !--------------------------
+    ! Case 2: ncurve > 1
+    !   Interpolate or extrapolate
+    !--------------------------
+
+    ! Extrapolate below minimum using first two points
+    else
+      if (sfcelv <= elev_curve(1)) then
+        x0 = elev_curve(1)
+        y0 = vol_curve(1)
+        x1 = elev_curve(2)
+        y1 = vol_curve(2)
+
+        if (x1 <= x0) then
+          vol_out = y0
+        else
+          frac = (sfcelv - x0) / (x1 - x0)
+          vol_out = y0 + frac * (y1 - y0)
+        endif
+
+      ! Extrapolate above maximum using last two points
+      elseif (sfcelv >= elev_curve(ncurve)) then
+        x0 = elev_curve(ncurve-1)
+        y0 = vol_curve(ncurve-1)
+        x1 = elev_curve(ncurve)
+        y1 = vol_curve(ncurve)
+
+        if (x1 <= x0) then
+          vol_out = y1
+        else
+          frac = (sfcelv - x0) / (x1 - x0)
+          vol_out = y0 + frac * (y1 - y0)
+        endif
+
+      ! Interpolate inside range via binary search bracketing
+      else
+        klo = 1
+        khi = ncurve
+        do while (khi - klo > 1)
+          kmid = (klo + khi) / 2
+          if (sfcelv >= elev_curve(kmid)) then
+            klo = kmid
+          else
+            khi = kmid
+          endif
+        enddo
+
+        x0 = elev_curve(klo)
+        y0 = vol_curve(klo)
+        x1 = elev_curve(khi)
+        y1 = vol_curve(khi)
+
+        ! Guard against duplicate elevations (should not happen after dedup)
+        if (x1 <= x0) then
+          vol_out = y0
+        else
+          frac = (sfcelv - x0) / (x1 - x0)
+          vol_out = y0 + frac * (y1 - y0)
+        endif
+      endif
+    endif
+
+  end subroutine HYMAP3_sfcelv_to_vol_linear
 
 end module HYMAP3_resopMod_Yassin

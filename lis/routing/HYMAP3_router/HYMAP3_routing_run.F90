@@ -361,7 +361,7 @@ subroutine HYMAP3_routing_run(n)
                 HYMAP3_routing_struc(n)%seqx,&
                 HYMAP3_routing_struc(n)%seqy,tmpb,baseflow)
 
-           !bias correct runoff fields
+         !bias correct runoff fields
            if(HYMAP3_routing_struc(n)%rbiasflag>0)then
              where(HYMAP3_routing_struc(n)%rbias_ratio/=HYMAP3_routing_struc(n)%imis.and.&
                surface_runoff/=HYMAP3_routing_struc(n)%imis)
@@ -580,7 +580,7 @@ subroutine HYMAP3_routing_run(n)
         endif
 
         !bias correct runoff fields
-        if(HYMAP3_routing_struc(n)%rbiasflag>0)then
+        if(HYMAP3_routing_struc(n)%rbiasflag==1)then
           where(HYMAP3_routing_struc(n)%rbias_ratio/=HYMAP3_routing_struc(n)%imis.and.&
             surface_runoff/=HYMAP3_routing_struc(n)%imis)
             surface_runoff=surface_runoff*HYMAP3_routing_struc(n)%rbias_ratio
