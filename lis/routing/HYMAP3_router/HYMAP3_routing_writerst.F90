@@ -678,7 +678,7 @@ subroutine HYMAP3_writevar_restart(ftn, n, var, varid)
 ! !ARGUMENTS:
   integer, intent(in) :: ftn
   integer, intent(in) :: n
-  real, intent(in)    :: var(LIS_rc%nroutinggrid(n))
+  real, intent(in)    :: var(HYMAP3_routing_struc(n)%nseqall)
   integer, intent(in) :: varid
 
 ! !DESCRIPTION:
@@ -705,6 +705,21 @@ subroutine HYMAP3_writevar_restart(ftn, n, var, varid)
   external :: MPI_GATHERV
 #endif
 
+  !ag(22Nov2026) Catchment vectors gather by global river ID;
+  ! the NetCDF restart layout remains identical to rectangular routing.
+  if(HYMAP3_routing_struc(n)%catchment_active)then
+     allocate(gtmp(LIS_rc%glbnroutinggrid(n)))
+     call HYMAP3_gather_tiles(n,var,gtmp)
+     if(LIS_masterproc)then
+#if (defined USE_NETCDF3 || defined USE_NETCDF4)
+        ierr=nf90_put_var(ftn,varid,gtmp,(/1/), &
+             (/LIS_rc%glbnroutinggrid(n)/))
+        call LIS_verify(ierr,'nf90_put_var failed for catchment restart')
+#endif
+     endif
+     deallocate(gtmp)
+     return
+  endif
   if(LIS_masterproc) then
      allocate(gtmp(LIS_rc%glbnroutinggrid(n)))
      allocate(gtmp1(LIS_rc%glbnroutinggrid(n)))
@@ -765,7 +780,7 @@ subroutine HYMAP3_writevar_restart_ens(ftn, n, var, varid)
 ! !ARGUMENTS:
   integer, intent(in) :: ftn
   integer, intent(in) :: n
-  real, intent(in)    :: var(LIS_rc%nroutinggrid(n),LIS_rc%nensem(n))
+  real, intent(in)    :: var(HYMAP3_routing_struc(n)%nseqall,LIS_rc%nensem(n))
   integer, intent(in) :: varid
 
 ! !DESCRIPTION:
@@ -784,7 +799,7 @@ subroutine HYMAP3_writevar_restart_ens(ftn, n, var, varid)
 !  \end{description}
 !EOP
   real, allocatable :: gtmp(:)
-  real, allocatable :: gtmp1(:,:)
+  real, allocatable :: gtmp1(:,:),global_member(:)
   integer           :: m
   integer           :: l,i,ix,iy,ix1,iy1
   integer :: ierr
@@ -793,6 +808,30 @@ subroutine HYMAP3_writevar_restart_ens(ftn, n, var, varid)
   external :: MPI_GATHERV
 #endif
 
+  !ag(22Nov2026) Catchment restart preserves original global IDs and
+  ! member-interleaved NetCDF layout; no processor-order dependence.
+  if(HYMAP3_routing_struc(n)%catchment_active)then
+     allocate(global_member(LIS_rc%glbnroutinggrid(n)))
+     if(LIS_masterproc)allocate(gtmp(LIS_rc%glbnroutinggrid(n)*LIS_rc%nensem(n)))
+     do m=1,LIS_rc%nensem(n)
+        call HYMAP3_gather_tiles(n,var(:,m),global_member)
+        if(LIS_masterproc)then
+           do i=1,LIS_rc%glbnroutinggrid(n)
+              gtmp(m+(i-1)*LIS_rc%nensem(n))=global_member(i)
+           enddo
+        endif
+     enddo
+     if(LIS_masterproc)then
+#if (defined USE_NETCDF3 || defined USE_NETCDF4)
+        ierr=nf90_put_var(ftn,varid,gtmp,(/1/), &
+             (/LIS_rc%glbnroutinggrid(n)*LIS_rc%nensem(n)/))
+        call LIS_verify(ierr,'nf90_put_var failed for catchment ens restart')
+#endif
+        deallocate(gtmp)
+     endif
+     deallocate(global_member)
+     return
+  endif
   if(LIS_masterproc) then
      allocate(gtmp(LIS_rc%glbnroutinggrid(n)*LIS_rc%nensem(n)))
      allocate(gtmp1(LIS_rc%glbnroutinggrid(n),LIS_rc%nensem(n)))

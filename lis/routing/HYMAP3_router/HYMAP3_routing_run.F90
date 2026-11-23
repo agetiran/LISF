@@ -217,7 +217,7 @@ subroutine HYMAP3_routing_run(n)
 
         call LIS_tile2grid(n,tmpet,evapotranspiration_t)
 
-        call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+        call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
              HYMAP3_routing_struc(n)%nseqall,&
              HYMAP3_routing_struc(n)%imis,&
              HYMAP3_routing_struc(n)%seqx,&
@@ -286,27 +286,27 @@ subroutine HYMAP3_routing_run(n)
         call LIS_tile2grid(n,tmp_wind,sqrt(uwind**2+vwind**2))
         call LIS_tile2grid(n,tmp_qnet,(lwd+swd)/1e6)
 
-        call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+        call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
              HYMAP3_routing_struc(n)%nseqall,&
              HYMAP3_routing_struc(n)%imis,&
              HYMAP3_routing_struc(n)%seqx,&
              HYMAP3_routing_struc(n)%seqy,tmp_tmp,tair)
-        call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+        call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
              HYMAP3_routing_struc(n)%nseqall,&
              HYMAP3_routing_struc(n)%imis,&
              HYMAP3_routing_struc(n)%seqx,&
              HYMAP3_routing_struc(n)%seqy,tmp_q2,qair)
-        call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+        call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
              HYMAP3_routing_struc(n)%nseqall,&
              HYMAP3_routing_struc(n)%imis,&
              HYMAP3_routing_struc(n)%seqx,&
              HYMAP3_routing_struc(n)%seqy,tmp_psurf,pres)
-        call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+        call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
              HYMAP3_routing_struc(n)%nseqall,&
              HYMAP3_routing_struc(n)%imis,&
              HYMAP3_routing_struc(n)%seqx,&
              HYMAP3_routing_struc(n)%seqy,tmp_qnet,qnet)
-        call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+        call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
              HYMAP3_routing_struc(n)%nseqall,&
              HYMAP3_routing_struc(n)%imis,&
              HYMAP3_routing_struc(n)%seqx,&
@@ -349,13 +349,17 @@ subroutine HYMAP3_routing_run(n)
 
            call LIS_tile2grid(n,m,tmpr,surface_runoff_t)
            call LIS_tile2grid(n,m,tmpb,baseflow_t)
+           !ag(22Nov2026) Route LIS forcing to catchment-owned vectors.
+           ! Preview diagnostics are needed only while routing is rectangular.
+           if(.not.HYMAP3_routing_struc(n)%catchment_active) &
+                call HYMAP3_catchment_transfer_runoff(n,m,tmpr,tmpb)
 
-           call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+           call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
                 HYMAP3_routing_struc(n)%nseqall,&
                 HYMAP3_routing_struc(n)%imis,&
                 HYMAP3_routing_struc(n)%seqx,&
                 HYMAP3_routing_struc(n)%seqy,tmpr,surface_runoff)
-           call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+           call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
                 HYMAP3_routing_struc(n)%nseqall,&
                 HYMAP3_routing_struc(n)%imis,&
                 HYMAP3_routing_struc(n)%seqx,&
@@ -468,50 +472,50 @@ subroutine HYMAP3_routing_run(n)
 ! The following calls are done because the vector size in LIS and HYMAP
 ! are different (and because the LIS I/O system is being leveraged for
 ! output
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%rivsto(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%rivsto(:,m),&
                 rivsto_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%rivdph(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%rivdph(:,m),&
                 rivdph_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%rivvel(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%rivvel(:,m),&
                 rivvel_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%rivout(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%rivout(:,m),&
                 rivout_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%evpout(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%evpout(:,m),&
                 evpout_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%fldout(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%fldout(:,m),&
                 fldout_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%fldsto(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%fldsto(:,m),&
                 fldsto_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%flddph(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%flddph(:,m),&
                 flddph_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%fldvel(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%fldvel(:,m),&
                 fldvel_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%fldfrc(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%fldfrc(:,m),&
                 fldfrc_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%fldare(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%fldare(:,m),&
                 fldare_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%sfcelv(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%sfcelv(:,m),&
                 sfcelv_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%rnfsto(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%rnfsto(:,m),&
                 rnfsto_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%bsfsto(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%bsfsto(:,m),&
                 bsfsto_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%rnfdwi(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%rnfdwi(:,m),&
                 rnfdwi_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%bsfdwi(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%bsfdwi(:,m),&
                 bsfdwi_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%surfws(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%surfws(:,m),&
                 surfws_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%ewat(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%ewat(:,m),&
                 ewat_lvec)
-           call HYMAP3_grid2tile(n,m,HYMAP3_routing_struc(n)%edif(:,m),&
+           call HYMAP3_grid2tile_dispatch(n,m,HYMAP3_routing_struc(n)%edif(:,m),&
                 edif_lvec)
            !ag(27Apr2020)
            if(HYMAP3_routing_struc(n)%flowtype==4)then
-              call HYMAP3_grid2tile(n,m, &
+              call HYMAP3_grid2tile_dispatch(n,m, &
                    HYMAP3_routing_struc(n)%drsto(:,m),&
                    drsto_lvec)
-              call HYMAP3_grid2tile(n,m, &
+              call HYMAP3_grid2tile_dispatch(n,m, &
                    HYMAP3_routing_struc(n)%drout(:,m),&
                    drout_lvec)
            endif
@@ -550,13 +554,15 @@ subroutine HYMAP3_routing_run(n)
            !temporary solution
            call LIS_tile2grid(n,tmpr,surface_runoff_t)
            call LIS_tile2grid(n,tmpb,baseflow_t)
+           if(.not.HYMAP3_routing_struc(n)%catchment_active) &
+                call HYMAP3_catchment_transfer_runoff(n,1,tmpr,tmpb)
 
-           call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+           call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
                 HYMAP3_routing_struc(n)%nseqall,&
                 HYMAP3_routing_struc(n)%imis,&
                 HYMAP3_routing_struc(n)%seqx,&
                 HYMAP3_routing_struc(n)%seqy,tmpr,surface_runoff)
-           call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+           call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
                 HYMAP3_routing_struc(n)%nseqall,&
                 HYMAP3_routing_struc(n)%imis,&
                 HYMAP3_routing_struc(n)%seqx,&
@@ -565,13 +571,15 @@ subroutine HYMAP3_routing_run(n)
 
            call readrunoffdata(trim(LIS_rc%runoffdatasource)//char(0),&
                 n,tmpr,tmpb)
+           if(.not.HYMAP3_routing_struc(n)%catchment_active) &
+                call HYMAP3_catchment_transfer_runoff(n,1,tmpr,tmpb)
 
-           call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+           call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
                 HYMAP3_routing_struc(n)%nseqall,&
                 HYMAP3_routing_struc(n)%imis,&
                 HYMAP3_routing_struc(n)%seqx,&
                 HYMAP3_routing_struc(n)%seqy,tmpr,surface_runoff)
-           call HYMAP3_grid2vector(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+           call HYMAP3_grid2vector_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
                 HYMAP3_routing_struc(n)%nseqall,&
                 HYMAP3_routing_struc(n)%imis,&
                 HYMAP3_routing_struc(n)%seqx,&
@@ -688,49 +696,49 @@ subroutine HYMAP3_routing_run(n)
 ! are different (and because the LIS I/O system is being leveraged for
 ! output
 
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%rivsto(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%rivsto(:,1),&
              rivsto_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%rivdph(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%rivdph(:,1),&
              rivdph_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%rivvel(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%rivvel(:,1),&
              rivvel_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%rivout(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%rivout(:,1),&
              rivout_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%evpout(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%evpout(:,1),&
              evpout_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%fldout(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%fldout(:,1),&
              fldout_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%fldsto(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%fldsto(:,1),&
              fldsto_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%flddph(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%flddph(:,1),&
              flddph_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%fldvel(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%fldvel(:,1),&
              fldvel_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%fldfrc(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%fldfrc(:,1),&
              fldfrc_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%fldare(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%fldare(:,1),&
              fldare_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%sfcelv(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%sfcelv(:,1),&
              sfcelv_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%rnfsto(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%rnfsto(:,1),&
              rnfsto_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%bsfsto(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%bsfsto(:,1),&
              bsfsto_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%rnfdwi(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%rnfdwi(:,1),&
              rnfdwi_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%bsfdwi(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%bsfdwi(:,1),&
              bsfdwi_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%surfws(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%surfws(:,1),&
              surfws_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%ewat(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%ewat(:,1),&
              ewat_lvec)
-        call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%edif(:,1),&
+        call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%edif(:,1),&
              edif_lvec)
         !ag(27Apr2020)
         if(HYMAP3_routing_struc(n)%flowtype==4)then
-           call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%drsto(:,1),&
+           call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%drsto(:,1),&
                 drsto_lvec)
-           call HYMAP3_grid2tile(n,1,HYMAP3_routing_struc(n)%drout(:,1),&
+           call HYMAP3_grid2tile_dispatch(n,1,HYMAP3_routing_struc(n)%drout(:,1),&
                 drout_lvec)
         endif
         !ag (12Sep2019)
@@ -752,7 +760,7 @@ subroutine HYMAP3_routing_run(n)
                    HYMAP3_routing_struc(n)%grarea(i)
            enddo
 
-           call HYMAP3_vector2grid(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+           call HYMAP3_vector2grid_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
                 HYMAP3_routing_struc(n)%nseqall,&
                 HYMAP3_routing_struc(n)%imis, &
                 HYMAP3_routing_struc(n)%seqx,&
@@ -778,7 +786,7 @@ subroutine HYMAP3_routing_run(n)
                    HYMAP3_routing_struc(n)%grarea(i)
            enddo
 
-           call HYMAP3_vector2grid(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+           call HYMAP3_vector2grid_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
                 HYMAP3_routing_struc(n)%nseqall,&
                 HYMAP3_routing_struc(n)%imis, &
                 HYMAP3_routing_struc(n)%seqx, &
@@ -798,7 +806,7 @@ subroutine HYMAP3_routing_run(n)
            call LIS_verify(status)
 
            !create flooded fraction flags
-           call HYMAP3_vector2grid(LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
+           call HYMAP3_vector2grid_dispatch(n,LIS_rc%lnc(n),LIS_rc%lnr(n),1,&
                 HYMAP3_routing_struc(n)%nseqall,&
                 HYMAP3_routing_struc(n)%imis, &
                 HYMAP3_routing_struc(n)%seqx,&
@@ -975,3 +983,62 @@ subroutine HYMAP3_grid2tile(n,m,tvar,tvar_ens)
   enddo
 
 end subroutine HYMAP3_grid2tile
+
+!ag(22Nov2026) The original grid->vector is preserved for LIS rectangles.
+! Catchment ownership uses the same precomputed global-ID map as routing MPI.
+subroutine HYMAP3_grid2vector_dispatch(n,nx,ny,nz,nseq,imis,seqx,seqy,grid,vector)
+  use HYMAP3_initMod, only: HYMAP3_grid2vector
+  use HYMAP3_routingMod
+  implicit none
+  integer, intent(in) :: n,nx,ny,nz,nseq,imis
+  integer, intent(in) :: seqx(nseq),seqy(nseq)
+  real, intent(in) :: grid(nx,ny,nz)
+  real, intent(out) :: vector(nseq,nz)
+  if(HYMAP3_routing_struc(n)%catchment_active)then
+     call HYMAP3_catchment_extract_grid(n,grid(:,:,1),vector(:,1))
+  else
+     call HYMAP3_grid2vector(nx,ny,nz,nseq,imis,seqx,seqy,grid,vector)
+  endif
+end subroutine HYMAP3_grid2vector_dispatch
+
+!ag(22Nov2026) Model output returns to LIS' ORIGINAL rectangular routing
+! sequence. This retains LIS history tile shape and global grid numbering.
+subroutine HYMAP3_grid2tile_dispatch(n,m,tvar,tvar_ens)
+  use HYMAP3_routingMod
+  use LIS_coreMod
+  implicit none
+  integer, intent(in) :: n,m
+  real, intent(in) :: tvar(HYMAP3_routing_struc(n)%nseqall)
+  real, intent(inout) :: tvar_ens(LIS_rc%nroutinggrid(n)*LIS_rc%nensem(n))
+  real, allocatable :: grid(:,:),original(:)
+  integer :: i
+  if(HYMAP3_routing_struc(n)%catchment_active)then
+     allocate(grid(LIS_rc%lnc(n),LIS_rc%lnr(n)))
+     call HYMAP3_catchment_restore_grid(n,tvar,grid)
+     allocate(original(LIS_rc%nroutinggrid(n)))
+     do i=1,LIS_rc%nroutinggrid(n)
+        original(i)=grid(HYMAP3_routing_struc(n)%catchment_rect_seqx(i), &
+             HYMAP3_routing_struc(n)%catchment_rect_seqy(i))
+     enddo
+     call HYMAP3_grid2tile(n,m,original,tvar_ens)
+  else
+     call HYMAP3_grid2tile(n,m,tvar,tvar_ens)
+  endif
+end subroutine HYMAP3_grid2tile_dispatch
+
+!ag(22Nov2026) Preserve the existing vector-to-grid conversion for
+! rectangular routing, but reverse-transfer catchment states to LIS cells.
+subroutine HYMAP3_vector2grid_dispatch(n,nx,ny,nz,nseq,imis,seqx,seqy,grid,vector)
+  use HYMAP3_initMod, only: HYMAP3_vector2grid
+  use HYMAP3_routingMod
+  implicit none
+  integer, intent(in) :: n,nx,ny,nz,nseq,imis
+  integer, intent(in) :: seqx(nseq),seqy(nseq)
+  real, intent(out) :: grid(nx,ny,nz)
+  real, intent(in) :: vector(nseq,nz)
+  if(HYMAP3_routing_struc(n)%catchment_active)then
+     call HYMAP3_catchment_restore_grid(n,vector(:,1),grid(:,:,1))
+  else
+     call HYMAP3_vector2grid(nx,ny,nz,nseq,imis,seqx,seqy,grid,vector)
+  endif
+end subroutine HYMAP3_vector2grid_dispatch

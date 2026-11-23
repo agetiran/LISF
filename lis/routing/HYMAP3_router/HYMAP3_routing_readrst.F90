@@ -229,7 +229,7 @@ subroutine HYMAP3_readvar_restart(ftn, n, var, varname)
 ! !ARGUMENTS:
   integer, intent(in)   :: ftn
   integer, intent(in)   :: n
-  real, intent(inout)   :: var(LIS_rc%nroutinggrid(n))
+  real, intent(inout)   :: var(HYMAP3_routing_struc(n)%nseqall)
   character(len=*), intent(in) :: varname
 
 ! !DESCRIPTION:
@@ -260,12 +260,17 @@ subroutine HYMAP3_readvar_restart(ftn, n, var, varname)
        'Error in nf90_get_var in HYMAP3_readvar_restart')
 #endif
 
-  do i=1,LIS_rc%nroutinggrid(n)
-     ix = HYMAP3_routing_struc(n)%seqx(i)
-     iy = HYMAP3_routing_struc(n)%seqy(i)
-     ix1 = ix + LIS_ews_halo_ind(n,LIS_localPet+1) -1
-     iy1 = iy + LIS_nss_halo_ind(n,LIS_localPet+1) -1
-     var(i)  = gtmp(HYMAP3_routing_struc(n)%sindex(ix1,iy1))
+  do i=1,HYMAP3_routing_struc(n)%nseqall
+     if(HYMAP3_routing_struc(n)%catchment_active)then
+        !ag(22Nov2026) Restart uses permanent global river ID.
+        var(i)=gtmp(HYMAP3_routing_struc(n)%network%local2gl(i))
+     else
+        ix = HYMAP3_routing_struc(n)%seqx(i)
+        iy = HYMAP3_routing_struc(n)%seqy(i)
+        ix1 = ix + LIS_ews_halo_ind(n,LIS_localPet+1) -1
+        iy1 = iy + LIS_nss_halo_ind(n,LIS_localPet+1) -1
+        var(i) = gtmp(HYMAP3_routing_struc(n)%sindex(ix1,iy1))
+     endif
   enddo
 
   deallocate(gtmp)
@@ -290,7 +295,7 @@ subroutine HYMAP3_readvar_restart_ens(ftn, n, var, varname)
 ! !ARGUMENTS:
   integer, intent(in)   :: ftn
   integer, intent(in)   :: n
-  real, intent(inout)   :: var(LIS_rc%nroutinggrid(n), &
+  real, intent(inout)   :: var(HYMAP3_routing_struc(n)%nseqall, &
        LIS_rc%nensem(n))
   character(len=*), intent(in) :: varname
 
@@ -321,15 +326,20 @@ subroutine HYMAP3_readvar_restart_ens(ftn, n, var, varname)
   call LIS_verify(status, &
        'Error in nf90_get_var in HYMAP3_readvar_restart_ens')
 #endif
-  do i=1,LIS_rc%nroutinggrid(n)
+  do i=1,HYMAP3_routing_struc(n)%nseqall
      do m=1,LIS_rc%nensem(n)
-        ix = HYMAP3_routing_struc(n)%seqx(i)
-        iy = HYMAP3_routing_struc(n)%seqy(i)
-        ix1 = ix + LIS_ews_halo_ind(n,LIS_localPet+1) -1
-        iy1 = iy + LIS_nss_halo_ind(n,LIS_localPet+1) -1
-
-        var(i,m)  = gtmp(m + &
-             (HYMAP3_routing_struc(n)%sindex(ix1,iy1)-1)*LIS_rc%nensem(n))
+        if(HYMAP3_routing_struc(n)%catchment_active)then
+           !ag(22Nov2026) Maintain global river-index restart ordering.
+           var(i,m)=gtmp(m + &
+                (HYMAP3_routing_struc(n)%network%local2gl(i)-1)*LIS_rc%nensem(n))
+        else
+           ix = HYMAP3_routing_struc(n)%seqx(i)
+           iy = HYMAP3_routing_struc(n)%seqy(i)
+           ix1 = ix + LIS_ews_halo_ind(n,LIS_localPet+1) -1
+           iy1 = iy + LIS_nss_halo_ind(n,LIS_localPet+1) -1
+           var(i,m)=gtmp(m + &
+                (HYMAP3_routing_struc(n)%sindex(ix1,iy1)-1)*LIS_rc%nensem(n))
+        endif
 
      enddo
   enddo

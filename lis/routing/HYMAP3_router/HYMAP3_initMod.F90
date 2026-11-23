@@ -190,6 +190,10 @@ contains
 
     i=0
 
+    !ag(22Nov2026) Outlets have no downstream cell. Explicitly initialize
+    ! the entire array before the grid-to-vector sequence is constructed;
+    ! catchment partitioning must never inspect undefined outlet indices.
+    next=0
     sindex=imis
     do ix=1,nxg
        do iy=1,nyg

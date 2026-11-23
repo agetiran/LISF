@@ -42,6 +42,12 @@ module HYMAP3_routingMod
   use LIS_constantsMod, only: LIS_CONST_PATH_LEN
   use LIS_topoMod
   use HYMAP3_netcdf_utilsMod
+  !ag(22Nov2026) Independent catchment partitioning and LIS transfer plan.
+  use HYMAP3_catchmentPartMod
+  use HYMAP3_catchmentMapMod
+  use HYMAP3_catchmentMPIMod
+  !ag(23Nov2026) Initialization-only processor decomposition diagnostics.
+  use HYMAP3_decompDiagMod
 
   implicit none
 
@@ -70,6 +76,8 @@ module HYMAP3_routingMod
   public :: HYMAP3_network_build_operator_map
   public :: HYMAP3_network_operator_gather
   public :: HYMAP3_network_operator_scatter
+  public :: HYMAP3_catchment_transfer_runoff
+  public :: HYMAP3_catchment_extract_grid, HYMAP3_catchment_restore_grid
 
 !-----------------------------------------------------------------------------
 ! !PUBLIC TYPES:
@@ -153,6 +161,25 @@ module HYMAP3_routingMod
      ! is enabled by default. Set option 0 explicitly to retain the
      ! original full-domain gather/broadcast implementation.
      integer :: network_mpi_flag = 1
+     !ag(22Nov2026) Preview mode only. Existing rectangular routing runs
+     ! unchanged while catchment ownership and transfer lists are audited.
+     integer :: catchment_preview_flag = 0
+     !ag(23Nov2026) Log decomposition statistics for every simulation.
+     ! NetCDF diagnostic maps remain opt-in; no hydrological calculations change.
+     integer :: decomposition_log_flag = 1
+     integer :: decomposition_nc_flag = 0
+     character(512) :: decomposition_nc_dir = '.'
+     !ag(22Nov2026) New active ownership; never alter LIS's rectangular
+     ! routing tile counts. The old preview flag retains its diagnostics.
+     logical :: catchment_active = .false.
+     logical :: catchment_initialized = .false. ! !ag(22Nov2026) active indices are ready
+     integer, allocatable :: catchment_rect_index(:)  ! global ID -> LIS rank-order index
+     integer, allocatable :: catchment_rect_seqx(:),catchment_rect_seqy(:)
+     integer, allocatable :: catchment_counts(:),catchment_offsets(:)
+     integer, allocatable :: catchment_owner(:)
+     integer, allocatable :: catchment_gx(:),catchment_gy(:)
+     real, allocatable :: catchment_runoff(:,:),catchment_baseflow(:,:)
+     type(HYMAP3_catchment_transfer_dec) :: catchment_transfer
      type(HYMAP3_network_mpi_dec) :: network
      integer, allocatable :: nextx(:,:)
      integer, allocatable :: nexty(:,:)
@@ -523,6 +550,12 @@ contains
     integer, allocatable :: resop_id_tmp(:), node_id_tmp(:)
 
     !ag(18Jun2026)
+    !ag(22Nov2026) Catchment-partition initialization diagnostics.
+    integer, allocatable :: catch_load(:),catch_source(:)
+    integer :: catch_status, catch_cut, catch_dx, catch_dy, catch_gid
+    real, allocatable :: catch_grid(:,:,:),catch_back(:,:,:),catch_vec(:,:)
+    character(160) :: catch_message
+
     integer, allocatable :: resop_x(:),resop_y(:)
 
     !ag(3Jul2026)
@@ -575,6 +608,93 @@ contains
        enddo
     endif
 
+    !ag(23Nov2026) Report decomposition statistics by default.
+    ! NetCDF output is optional and does not change the routing state.
+    call ESMF_ConfigFindLabel(LIS_config, &
+         "HYMAP3 decomposition diagnostics:",rc=status)
+    if(status==0)then
+       do n=1,LIS_rc%nnest
+          call ESMF_ConfigGetAttribute(LIS_config, &
+               HYMAP3_routing_struc(n)%decomposition_log_flag,rc=status)
+          call LIS_verify(status,"HYMAP3 decomposition diagnostics: invalid value")
+          if(HYMAP3_routing_struc(n)%decomposition_log_flag/=0.and. &
+               HYMAP3_routing_struc(n)%decomposition_log_flag/=1)then
+             write(LIS_logunit,*) '[ERR] HYMAP3 decomposition diagnostics must be 0 or 1'
+             call LIS_endrun()
+          endif
+       enddo
+    endif
+    call ESMF_ConfigFindLabel(LIS_config, &
+         "HYMAP3 decomposition NetCDF output:",rc=status)
+    if(status==0)then
+       do n=1,LIS_rc%nnest
+          call ESMF_ConfigGetAttribute(LIS_config, &
+               HYMAP3_routing_struc(n)%decomposition_nc_flag,rc=status)
+          call LIS_verify(status,"HYMAP3 decomposition NetCDF output: invalid value")
+          if(HYMAP3_routing_struc(n)%decomposition_nc_flag/=0.and. &
+               HYMAP3_routing_struc(n)%decomposition_nc_flag/=1)then
+             write(LIS_logunit,*) '[ERR] HYMAP3 decomposition NetCDF output must be 0 or 1'
+             call LIS_endrun()
+          endif
+       enddo
+    endif
+
+    !ag(23Nov2026) Optional destination for decomposition NetCDF maps.
+    ! The default is the LIS working directory; the directory must exist.
+    call ESMF_ConfigFindLabel(LIS_config, &
+         "HYMAP3 decomposition NetCDF directory:",rc=status)
+    if(status==0)then
+       do n=1,LIS_rc%nnest
+          call ESMF_ConfigGetAttribute(LIS_config, &
+               HYMAP3_routing_struc(n)%decomposition_nc_dir,rc=status)
+          call LIS_verify(status,"HYMAP3 decomposition NetCDF directory: invalid value")
+       enddo
+    endif
+
+    !ag(22Nov2026) This is explicitly a NON-ACTIVATING preview.
+    ! It checks the graph, catchment loads and LIS->HyMAP MPI schedules
+    ! without changing LIS_rc%nroutinggrid, the routing tiles or physics.
+    call ESMF_ConfigFindLabel(LIS_config,&
+         "HYMAP3 catchment decomposition preview:",rc=status)
+    if(status==0)then
+       do n=1,LIS_rc%nnest
+          call ESMF_ConfigGetAttribute(LIS_config,&
+               HYMAP3_routing_struc(n)%catchment_preview_flag,rc=status)
+          call LIS_verify(status,&
+               "HYMAP3 catchment decomposition preview: invalid value")
+          if(HYMAP3_routing_struc(n)%catchment_preview_flag/=0.and. &
+               HYMAP3_routing_struc(n)%catchment_preview_flag/=1)then
+             write(LIS_logunit,*) '[ERR] Catchment preview must be 0 or 1'
+             call LIS_endrun()
+          endif
+       enddo
+    endif
+
+    !ag(22Nov2026) Active catchment-based processing is independent of
+    ! the input's 2-D-to-1-D conversion. Rectangular remains the default.
+    call ESMF_ConfigFindLabel(LIS_config, &
+         "HYMAP3 processor decomposition:",rc=status)
+    if(status==0)then
+       do n=1,LIS_rc%nnest
+          call ESMF_ConfigGetAttribute(LIS_config,flowtype,rc=status)
+          call LIS_verify(status,"HYMAP3 processor decomposition: invalid value")
+          select case(trim(adjustl(flowtype)))
+          case('rectangular')
+             HYMAP3_routing_struc(n)%catchment_active=.false.
+          case('catchment')
+             HYMAP3_routing_struc(n)%catchment_active=.true.
+             HYMAP3_routing_struc(n)%catchment_preview_flag=1
+             if(HYMAP3_routing_struc(n)%network_mpi_flag/=1)then
+                write(LIS_logunit,*) '[ERR] Catchment routing requires network MPI option 1'
+                call LIS_endrun()
+             endif
+          case default
+             write(LIS_logunit,*) '[ERR] Invalid HYMAP3 processor decomposition:',trim(flowtype)
+             call LIS_endrun()
+          end select
+       enddo
+    endif
+
     !ag(14Apr2025)
     call ESMF_ConfigFindLabel(LIS_config,&
          "HYMAP3 vector input file:",rc=status)
@@ -595,6 +715,11 @@ contains
                HYMAP3_routing_struc(n)%nz,HYMAP3_routing_struc(n)%nseqall
        else
           write(LIS_logunit,*) '[INFO] HYMAP3 parameters in 2D grid mode'
+       endif
+       if(HYMAP3_routing_struc(n)%catchment_preview_flag==1.and. &
+            HYMAP3_routing_struc(n)%vecflag/=0)then
+          write(LIS_logunit,*) '[ERR] Catchment preview currently requires gridded input'
+          call LIS_endrun()
        endif
     enddo
 
@@ -984,6 +1109,10 @@ contains
             LIS_mpi_comm,status)
 #else
        LIS_rc%glbnroutinggrid(n) = LIS_rc%nroutinggrid(n)
+       !ag(22Nov2026) Global LIS rectangle offsets are also required
+       ! by the catchment redistribution when running without SPMD.
+       LIS_routing_gdeltas(n,0)=LIS_rc%nroutinggrid(n)
+       LIS_routing_goffsets(n,0)=0
 #endif
 
        if(LIS_masterproc) then
@@ -1362,6 +1491,31 @@ contains
        !read grid-based input parameters
        if(HYMAP3_routing_struc(n)%vecflag==0)then
           write(LIS_logunit,*) '[INFO] Get HYMAP3 cell vector sequence'
+          !ag(22Nov2026) Guard downstream pointers in the preview BEFORE
+          ! constructing the global sequence; the original conversion
+          ! assumes these coordinates and destination cells are valid.
+          if(HYMAP3_routing_struc(n)%catchment_preview_flag==1)then
+             do ix=1,LIS_rc%gnc(n)
+                do iy=1,LIS_rc%gnr(n)
+                   if(maskg(ix,iy)<=0)cycle
+                   catch_dx=HYMAP3_routing_struc(n)%nextx(ix,iy)
+                   if(catch_dx==HYMAP3_routing_struc(n)%imis.or.catch_dx<=0)cycle
+                   catch_dy=HYMAP3_routing_struc(n)%nexty(ix,iy)
+                   if(catch_dx<1.or.catch_dx>LIS_rc%gnc(n).or. &
+                        catch_dy<1.or.catch_dy>LIS_rc%gnr(n))then
+                      write(LIS_logunit,*) '[ERR] HyMAP downstream coordinates outside grid',ix,iy
+                      call LIS_endrun()
+                   endif
+                   if(maskg(catch_dx,catch_dy)<=0.or. &
+                        HYMAP3_routing_struc(n)%nextx(catch_dx,catch_dy)== &
+                        HYMAP3_routing_struc(n)%imis)then
+                      write(LIS_logunit,*) '[ERR] HyMAP downstream cell not in river network',ix,iy
+                      call LIS_endrun()
+                   endif
+                enddo
+             enddo
+          endif
+
           call HYMAP3_get_sindex(LIS_rc%gnc(n),&
                LIS_rc%gnr(n),&
                LIS_rc%glbnroutinggrid(n),&
@@ -1371,6 +1525,141 @@ contains
                HYMAP3_routing_struc(n)%sindex,&
                HYMAP3_routing_struc(n)%outlet_glb,&
                HYMAP3_routing_struc(n)%next_glb)
+
+          !ag(22Nov2026) Build the ownership and LIS forcing map once.
+          ! Preview mode leaves routing rectangular. The catchment mode
+          ! activates these mappings after regular initialization completes.
+          if(HYMAP3_routing_struc(n)%catchment_preview_flag==1)then
+             allocate(HYMAP3_routing_struc(n)%catchment_owner( &
+                  LIS_rc%glbnroutinggrid(n)))
+             allocate(catch_load(LIS_npes))
+             call HYMAP3_partition_catchments( &
+                  HYMAP3_routing_struc(n)%next_glb,LIS_npes, &
+                  HYMAP3_routing_struc(n)%catchment_owner,catch_load, &
+                  catch_cut,catch_status,catch_message)
+             if(catch_status/=0)then
+                write(LIS_logunit,*) '[ERR] HYMAP3 catchment partition: ',trim(catch_message)
+                call LIS_endrun()
+             endif
+             allocate(catch_source(LIS_rc%glbnroutinggrid(n)))
+             call HYMAP3_catchment_map_sources( &
+                  HYMAP3_routing_struc(n)%sindex,LIS_npes, &
+                  LIS_ews_ind(n,:),LIS_ewe_ind(n,:), &
+                  LIS_nss_ind(n,:),LIS_nse_ind(n,:), &
+                  catch_source,catch_status,catch_message)
+             if(catch_status/=0)then
+                write(LIS_logunit,*) '[ERR] HYMAP3 LIS-to-catchment mapping: ', &
+                     trim(catch_message)
+                call LIS_endrun()
+             endif
+             call HYMAP3_catchment_build_transfer(catch_source, &
+                  HYMAP3_routing_struc(n)%catchment_owner,LIS_npes, &
+                  LIS_localPet,HYMAP3_routing_struc(n)%catchment_transfer, &
+                  catch_status,catch_message)
+             if(catch_status/=0)then
+                write(LIS_logunit,*) '[ERR] HYMAP3 transfer plan: ',trim(catch_message)
+                call LIS_endrun()
+             endif
+             !ag(22Nov2026) Construct inverse grid coordinates in GLOBAL
+             ! river index order; seqx_glb/seqy_glb are rank-concatenated.
+             allocate(HYMAP3_routing_struc(n)%catchment_gx( &
+                  LIS_rc%glbnroutinggrid(n)))
+             allocate(HYMAP3_routing_struc(n)%catchment_gy( &
+                  LIS_rc%glbnroutinggrid(n)))
+             HYMAP3_routing_struc(n)%catchment_gx=0
+             HYMAP3_routing_struc(n)%catchment_gy=0
+             do iy=1,LIS_rc%gnr(n)
+                do ix=1,LIS_rc%gnc(n)
+                   catch_gid=HYMAP3_routing_struc(n)%sindex(ix,iy)
+                   if(catch_gid<=0)cycle
+                   if(catch_gid>LIS_rc%glbnroutinggrid(n))then
+                      write(LIS_logunit,*) '[ERR] HYMAP3 catchment invalid global ID',catch_gid
+                      call LIS_endrun()
+                   endif
+                   if(HYMAP3_routing_struc(n)%catchment_gx(catch_gid)/=0)then
+                      write(LIS_logunit,*) '[ERR] HYMAP3 catchment duplicate global ID',catch_gid
+                      call LIS_endrun()
+                   endif
+                   HYMAP3_routing_struc(n)%catchment_gx(catch_gid)=ix
+                   HYMAP3_routing_struc(n)%catchment_gy(catch_gid)=iy
+                enddo
+             enddo
+             if(any(HYMAP3_routing_struc(n)%catchment_gx==0))then
+                write(LIS_logunit,*) '[ERR] HYMAP3 catchment missing global cell'
+                call LIS_endrun()
+             endif
+
+             ! Verify actual MPI communication, including reverse mapping.
+             ! This is a diagnostic: routing vectors remain rectangular.
+             allocate(catch_grid(LIS_rc%lnc(n),LIS_rc%lnr(n),2))
+             allocate(catch_back(LIS_rc%lnc(n),LIS_rc%lnr(n),2))
+             allocate(catch_vec(2,size(HYMAP3_routing_struc(n)% &
+                  catchment_transfer%recv_gid)))
+             catch_grid=real(HYMAP3_routing_struc(n)%imis)
+             do iy=1,LIS_rc%lnr(n)
+                do ix=1,LIS_rc%lnc(n)
+                   catch_dx=ix+LIS_ews_halo_ind(n,LIS_localPet+1)-1
+                   catch_dy=iy+LIS_nss_halo_ind(n,LIS_localPet+1)-1
+                   catch_gid=HYMAP3_routing_struc(n)%sindex(catch_dx,catch_dy)
+                   if(catch_gid<=0)cycle
+                   if(catch_source(catch_gid)/=LIS_localPet)cycle
+                   catch_grid(ix,iy,1)=real(mod(catch_gid,1000000))
+                   catch_grid(ix,iy,2)=-real(mod(catch_gid,1000000))-0.5
+                enddo
+             enddo
+             call HYMAP3_catchment_forward( &
+                  HYMAP3_routing_struc(n)%catchment_transfer, &
+                  HYMAP3_routing_struc(n)%catchment_gx, &
+                  HYMAP3_routing_struc(n)%catchment_gy, &
+                  LIS_ews_halo_ind(n,LIS_localPet+1), &
+                  LIS_nss_halo_ind(n,LIS_localPet+1), &
+                  catch_grid,catch_vec,catch_status)
+             if(catch_status/=0)then
+                write(LIS_logunit,*) '[ERR] HYMAP3 catchment forward MPI',catch_status
+                call LIS_endrun()
+             endif
+             call HYMAP3_catchment_reverse( &
+                  HYMAP3_routing_struc(n)%catchment_transfer, &
+                  HYMAP3_routing_struc(n)%catchment_gx, &
+                  HYMAP3_routing_struc(n)%catchment_gy, &
+                  LIS_ews_halo_ind(n,LIS_localPet+1), &
+                  LIS_nss_halo_ind(n,LIS_localPet+1), &
+                  catch_vec,catch_back,real(HYMAP3_routing_struc(n)%imis), &
+                  catch_status)
+             if(catch_status/=0)then
+                write(LIS_logunit,*) '[ERR] HYMAP3 catchment reverse MPI',catch_status
+                call LIS_endrun()
+             endif
+             if(any(catch_grid/=catch_back))then
+                write(LIS_logunit,*) '[ERR] HYMAP3 catchment MPI roundtrip mismatch',LIS_localPet
+                call LIS_endrun()
+             endif
+             write(LIS_logunit,*) '[INFO] HYMAP3 catchment MPI exact forward/reverse PASS',LIS_localPet
+             deallocate(catch_grid,catch_back,catch_vec)
+             ! Catchment-owned vectors for actual LIS runoff/baseflow values.
+             ! The existing rectangular vectors continue to drive routing
+             ! until the independent routing-tile ownership change is ready.
+             allocate(HYMAP3_routing_struc(n)%catchment_runoff( &
+                  size(HYMAP3_routing_struc(n)%catchment_transfer%recv_gid), &
+                  LIS_rc%nensem(n)))
+             allocate(HYMAP3_routing_struc(n)%catchment_baseflow( &
+                  size(HYMAP3_routing_struc(n)%catchment_transfer%recv_gid), &
+                  LIS_rc%nensem(n)))
+             HYMAP3_routing_struc(n)%catchment_runoff=0.0
+             HYMAP3_routing_struc(n)%catchment_baseflow=0.0
+
+             if(LIS_masterproc)then
+                write(LIS_logunit,*) '[INFO] HYMAP3 catchment mapping: river cells, ranks, cuts', &
+                     LIS_rc%glbnroutinggrid(n),LIS_npes,catch_cut
+                write(LIS_logunit,*) '[INFO] HYMAP3 catchment mapping: min/max cells per rank', &
+                     minval(catch_load),maxval(catch_load)
+             endif
+             write(LIS_logunit,*) '[INFO] HYMAP3 catchment mapping: rank, LIS sends, HYMAP receives', &
+                  LIS_localPet, &
+                  size(HYMAP3_routing_struc(n)%catchment_transfer%send_gid), &
+                  size(HYMAP3_routing_struc(n)%catchment_transfer%recv_gid)
+             deallocate(catch_source,catch_load)
+          endif
 
           call HYMAP3_get_seq(LIS_rc%lnc(n),LIS_rc%lnr(n),&
                LIS_rc%gnc(n),LIS_rc%gnr(n),&
@@ -1401,6 +1690,11 @@ contains
                LIS_routing_goffsets(n,:),&
                MPI_INTEGER,&
                LIS_mpi_comm,status)
+#else
+          !ag(22Nov2026) Preserve the original rank-order coordinate lists
+          ! without MPI; both routing decompositions need this mapping.
+          HYMAP3_routing_struc(n)%seqx_glb=HYMAP3_routing_struc(n)%seqx
+          HYMAP3_routing_struc(n)%seqy_glb=HYMAP3_routing_struc(n)%seqy
 #endif
 
           allocate(tmp_real(LIS_rc%lnc(n),LIS_rc%lnr(n)))
@@ -2720,7 +3014,8 @@ contains
     ! and streamflow insertion now use compact owner-to-root cell exchange.
     ! This guard is intentionally explicit, never silently skip physics.
     do n=1,LIS_rc%nnest
-       if(HYMAP3_routing_struc(n)%network_mpi_flag==1)then
+       if(HYMAP3_routing_struc(n)%network_mpi_flag==1.and. &
+            .not.HYMAP3_routing_struc(n)%catchment_active)then
           !ag (21Nov2026) Urban network MPI:
           ! Urban is now supported by a separate sparse drainage graph.
           ! Preserve only the pre-existing vector-input exclusion.
@@ -3269,8 +3564,444 @@ contains
        enddo
     end if
 
+    !ag(22Nov2026) All gridded parameters, initial states, and optional
+    ! operator metadata are now initialized. Preserve LIS' rectangular
+    ! routing tile allocations; only redistribute HyMAP-owned vectors.
+    do n=1,LIS_rc%nnest
+       if(HYMAP3_routing_struc(n)%catchment_active)then
+          if(Routing_DAvalid.or.LIS_rc%nperts>0)then
+             write(LIS_logunit,*) &
+                  '[ERR] Catchment routing with routing DA/perturbation is not yet validated'
+             call LIS_endrun()
+          endif
+          call HYMAP3_activate_catchment(n)
+          call HYMAP3_network_build(n)
+          if(HYMAP3_routing_struc(n)%flowtype==4)call HYMAP3_network_build_urban(n)
+          call HYMAP3_network_build_operator_map(n)
+          HYMAP3_routing_struc(n)%catchment_initialized=.true.
+          write(LIS_logunit,*) '[INFO] HYMAP3 active catchment MPI rank/elements', &
+               LIS_localPet, HYMAP3_routing_struc(n)%nseqall
+       endif
+    enddo
+
+    !ag(23Nov2026) Compute loads and hydrologic cross-rank links from
+    ! permanent global river IDs; never change the routing ownership.
+    ! The master alone writes logs/maps; no extra MPI transfers are needed.
+    if(LIS_masterproc)then
+       do n=1,LIS_rc%nnest
+          if(HYMAP3_routing_struc(n)%decomposition_log_flag/=1.and. &
+               HYMAP3_routing_struc(n)%decomposition_nc_flag/=1)cycle
+          if(HYMAP3_routing_struc(n)%vecflag==0)then
+             call HYMAP3_report_decomposition(n)
+          else
+             write(LIS_logunit,*) &
+                  '[WARN] HYMAP3 decomposition NetCDF map requires a gridded domain'
+          endif
+       enddo
+    endif
+
   end subroutine HYMAP3_routingInit
   !=============================================
+  !ag(22Nov2026) Move original LIS-owned HyMAP vectors to the catchment
+  ! processors. Global river IDs remain unchanged and provide the only
+  ! correspondence. LIS_rc%nroutinggrid and LIS_routing tiles are untouched.
+  subroutine HYMAP3_activate_catchment(n)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_routingMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    integer :: ng,nl,k,p,idx,ix,iy,gid,i,ierr
+    ng=LIS_rc%glbnroutinggrid(n)
+    nl=size(HYMAP3_routing_struc(n)%catchment_transfer%recv_gid)
+    if(nl<1)then
+       write(LIS_logunit,*) '[ERR] Empty active catchment processor',LIS_localPet
+       call LIS_endrun()
+    endif
+    allocate(HYMAP3_routing_struc(n)%catchment_rect_index(ng))
+    allocate(HYMAP3_routing_struc(n)%catchment_rect_seqx( &
+         LIS_rc%nroutinggrid(n)),HYMAP3_routing_struc(n)%catchment_rect_seqy( &
+         LIS_rc%nroutinggrid(n)))
+    HYMAP3_routing_struc(n)%catchment_rect_seqx=HYMAP3_routing_struc(n)%seqx
+    HYMAP3_routing_struc(n)%catchment_rect_seqy=HYMAP3_routing_struc(n)%seqy
+    HYMAP3_routing_struc(n)%catchment_rect_index=0
+    do p=0,LIS_npes-1
+       do k=1,LIS_routing_gdeltas(n,p)
+          idx=k+LIS_routing_goffsets(n,p)
+          ix=HYMAP3_routing_struc(n)%seqx_glb(idx)+LIS_ews_halo_ind(n,p+1)-1
+          iy=HYMAP3_routing_struc(n)%seqy_glb(idx)+LIS_nss_halo_ind(n,p+1)-1
+          gid=HYMAP3_routing_struc(n)%sindex(ix,iy)
+          if(gid<1.or.gid>ng)then
+             write(LIS_logunit,*) '[ERR] Bad original rectangular global ID',p,idx,gid
+             call LIS_endrun()
+          endif
+          if(HYMAP3_routing_struc(n)%catchment_rect_index(gid)/=0)then
+             write(LIS_logunit,*) '[ERR] Duplicate rectangular global ID',gid
+             call LIS_endrun()
+          endif
+          HYMAP3_routing_struc(n)%catchment_rect_index(gid)=idx
+       enddo
+    enddo
+    if(any(HYMAP3_routing_struc(n)%catchment_rect_index<1))then
+       write(LIS_logunit,*) '[ERR] Missing rectangular global ID in catchment mapping'
+       call LIS_endrun()
+    endif
+    allocate(HYMAP3_routing_struc(n)%catchment_counts(0:LIS_npes-1), &
+         HYMAP3_routing_struc(n)%catchment_offsets(0:LIS_npes))
+    do p=0,LIS_npes-1
+       HYMAP3_routing_struc(n)%catchment_counts(p)= &
+            count(HYMAP3_routing_struc(n)%catchment_owner==p)
+    enddo
+    HYMAP3_routing_struc(n)%catchment_offsets(0)=0
+    do p=0,LIS_npes-1
+       HYMAP3_routing_struc(n)%catchment_offsets(p+1)= &
+            HYMAP3_routing_struc(n)%catchment_offsets(p)+ &
+            HYMAP3_routing_struc(n)%catchment_counts(p)
+    enddo
+    if(HYMAP3_routing_struc(n)%catchment_counts(LIS_localPet)/=nl.or. &
+         HYMAP3_routing_struc(n)%catchment_offsets(LIS_npes)/=ng)then
+       write(LIS_logunit,*) '[ERR] Inconsistent catchment ownership counts'
+       call LIS_endrun()
+    endif
+
+    ! Move each original parameter/state without changing its value.
+    if(allocated(HYMAP3_routing_struc(n)%outletid)) &
+         call HYMAP3_catchment_reorder_int1(n,HYMAP3_routing_struc(n)%outletid)
+    if(allocated(HYMAP3_routing_struc(n)%elevtn)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%elevtn)
+    if(allocated(HYMAP3_routing_struc(n)%nxtdst)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%nxtdst)
+    if(allocated(HYMAP3_routing_struc(n)%grarea)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%grarea)
+    if(allocated(HYMAP3_routing_struc(n)%fldman)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%fldman)
+    if(allocated(HYMAP3_routing_struc(n)%trnoff)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%trnoff)
+    if(allocated(HYMAP3_routing_struc(n)%tbsflw)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%tbsflw)
+    if(allocated(HYMAP3_routing_struc(n)%cntime)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%cntime)
+    if(allocated(HYMAP3_routing_struc(n)%rivelv)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%rivelv)
+    if(allocated(HYMAP3_routing_struc(n)%rivlen)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%rivlen)
+    if(allocated(HYMAP3_routing_struc(n)%runoff0)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%runoff0)
+    if(allocated(HYMAP3_routing_struc(n)%basflw0)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%basflw0)
+    if(allocated(HYMAP3_routing_struc(n)%flowmap)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%flowmap)
+    if(allocated(HYMAP3_routing_struc(n)%bsfdwi_ratio)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%bsfdwi_ratio)
+    if(allocated(HYMAP3_routing_struc(n)%rnfdwi_ratio)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%rnfdwi_ratio)
+    if(allocated(HYMAP3_routing_struc(n)%drstomax)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%drstomax)
+    if(allocated(HYMAP3_routing_struc(n)%droutlet)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%droutlet)
+    if(allocated(HYMAP3_routing_struc(n)%drtotwth)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%drtotwth)
+    if(allocated(HYMAP3_routing_struc(n)%drnoutlet)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%drnoutlet)
+    if(allocated(HYMAP3_routing_struc(n)%drtotlgh)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%drtotlgh)
+    if(allocated(HYMAP3_routing_struc(n)%levhgt)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%levhgt)
+    if(allocated(HYMAP3_routing_struc(n)%rivslp)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%rivslp)
+    if(allocated(HYMAP3_routing_struc(n)%maxsfcslp)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%maxsfcslp)
+    if(allocated(HYMAP3_routing_struc(n)%rbias_ratio)) &
+         call HYMAP3_catchment_reorder1(n,HYMAP3_routing_struc(n)%rbias_ratio)
+    if(allocated(HYMAP3_routing_struc(n)%fldhgt)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldhgt)
+    if(allocated(HYMAP3_routing_struc(n)%rivman)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivman)
+    if(allocated(HYMAP3_routing_struc(n)%rivstomax)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivstomax)
+    if(allocated(HYMAP3_routing_struc(n)%rivwth)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivwth)
+    if(allocated(HYMAP3_routing_struc(n)%rivhgt)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivhgt)
+    if(allocated(HYMAP3_routing_struc(n)%rivare)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivare)
+    if(allocated(HYMAP3_routing_struc(n)%rivsto)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivsto)
+    if(allocated(HYMAP3_routing_struc(n)%rivdph)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivdph)
+    if(allocated(HYMAP3_routing_struc(n)%rivvel)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivvel)
+    if(allocated(HYMAP3_routing_struc(n)%rivout)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivout)
+    if(allocated(HYMAP3_routing_struc(n)%evpout)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%evpout)
+    if(allocated(HYMAP3_routing_struc(n)%fldout)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldout)
+    if(allocated(HYMAP3_routing_struc(n)%fldsto)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldsto)
+    if(allocated(HYMAP3_routing_struc(n)%flddph)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%flddph)
+    if(allocated(HYMAP3_routing_struc(n)%fldvel)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldvel)
+    if(allocated(HYMAP3_routing_struc(n)%fldfrc)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldfrc)
+    if(allocated(HYMAP3_routing_struc(n)%fldare)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldare)
+    if(allocated(HYMAP3_routing_struc(n)%sfcelv)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%sfcelv)
+    if(allocated(HYMAP3_routing_struc(n)%bsfdwi)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%bsfdwi)
+    if(allocated(HYMAP3_routing_struc(n)%rnfdwi)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rnfdwi)
+    if(allocated(HYMAP3_routing_struc(n)%surfws)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%surfws)
+    if(allocated(HYMAP3_routing_struc(n)%rnfsto)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rnfsto)
+    if(allocated(HYMAP3_routing_struc(n)%bsfsto)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%bsfsto)
+    if(allocated(HYMAP3_routing_struc(n)%ewat)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%ewat)
+    if(allocated(HYMAP3_routing_struc(n)%edif)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%edif)
+    if(allocated(HYMAP3_routing_struc(n)%rivout_pre)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivout_pre)
+    if(allocated(HYMAP3_routing_struc(n)%rivdph_pre)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivdph_pre)
+    if(allocated(HYMAP3_routing_struc(n)%fldout_pre)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldout_pre)
+    if(allocated(HYMAP3_routing_struc(n)%flddph_pre)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%flddph_pre)
+    if(allocated(HYMAP3_routing_struc(n)%fldelv1)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldelv1)
+    if(allocated(HYMAP3_routing_struc(n)%dtaout)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%dtaout)
+    if(allocated(HYMAP3_routing_struc(n)%rivstotmp)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%rivstotmp)
+    if(allocated(HYMAP3_routing_struc(n)%fldstotmp)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldstotmp)
+    if(allocated(HYMAP3_routing_struc(n)%fldfrctmp)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldfrctmp)
+    if(allocated(HYMAP3_routing_struc(n)%drsto)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%drsto)
+    if(allocated(HYMAP3_routing_struc(n)%drout)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%drout)
+    if(allocated(HYMAP3_routing_struc(n)%levstomax)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%levstomax)
+    if(allocated(HYMAP3_routing_struc(n)%fldstoatlev)) &
+         call HYMAP3_catchment_reorder2(n,HYMAP3_routing_struc(n)%fldstoatlev)
+    if(allocated(HYMAP3_routing_struc(n)%fldgrd)) &
+         call HYMAP3_catchment_reorder3(n,HYMAP3_routing_struc(n)%fldgrd)
+    if(allocated(HYMAP3_routing_struc(n)%fldstomax)) &
+         call HYMAP3_catchment_reorder3(n,HYMAP3_routing_struc(n)%fldstomax)
+    if(allocated(HYMAP3_routing_struc(n)%fldonlystomax)) &
+         call HYMAP3_catchment_reorder3(n,HYMAP3_routing_struc(n)%fldonlystomax)
+
+    ! Only after ALL rectangular fields have been moved may their indices
+    ! change. The original rectangular coordinates are retained above.
+    deallocate(HYMAP3_routing_struc(n)%seqx,HYMAP3_routing_struc(n)%seqy)
+    allocate(HYMAP3_routing_struc(n)%seqx(nl),HYMAP3_routing_struc(n)%seqy(nl))
+    deallocate(HYMAP3_routing_struc(n)%next,HYMAP3_routing_struc(n)%outlet)
+    allocate(HYMAP3_routing_struc(n)%next(nl),HYMAP3_routing_struc(n)%outlet(nl))
+    do i=1,nl
+       gid=HYMAP3_routing_struc(n)%catchment_transfer%recv_gid(i)
+       k=HYMAP3_routing_struc(n)%catchment_transfer%recv_local(i)
+       HYMAP3_routing_struc(n)%seqx(k)=HYMAP3_routing_struc(n)%catchment_gx(gid)
+       HYMAP3_routing_struc(n)%seqy(k)=HYMAP3_routing_struc(n)%catchment_gy(gid)
+       HYMAP3_routing_struc(n)%next(k)=HYMAP3_routing_struc(n)%next_glb(gid)
+       HYMAP3_routing_struc(n)%outlet(k)=HYMAP3_routing_struc(n)%outlet_glb(gid)
+    enddo
+    HYMAP3_routing_struc(n)%nseqall=nl
+  end subroutine HYMAP3_activate_catchment
+
+  !ag(22Nov2026) Move a first-dimension 1D routing field to its new owner.
+  ! Retains rank-concatenated LIS indexing only during this initialization.
+  !ag(22Nov2026) Same ownership permutation for integer river IDs.
+  subroutine HYMAP3_catchment_reorder_int1(n,var)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_routingMod
+    implicit none
+    integer, intent(in) :: n
+    integer, allocatable, intent(inout) :: var(:)
+    integer, allocatable :: all_rect(:),new(:)
+    integer :: i,gid,iloc,status
+    if(size(var)/=LIS_rc%nroutinggrid(n))error stop 'catchment integer field shape'
+    allocate(all_rect(LIS_rc%glbnroutinggrid(n)))
+#if (defined SPMD)
+    call MPI_ALLGATHERV(var,LIS_rc%nroutinggrid(n),MPI_INTEGER,all_rect, &
+         LIS_routing_gdeltas(n,:),LIS_routing_goffsets(n,:),MPI_INTEGER, &
+         LIS_mpi_comm,status)
+#else
+    all_rect=var
+#endif
+    allocate(new(size(HYMAP3_routing_struc(n)%catchment_transfer%recv_gid)))
+    do i=1,size(new)
+       gid=HYMAP3_routing_struc(n)%catchment_transfer%recv_gid(i)
+       iloc=HYMAP3_routing_struc(n)%catchment_transfer%recv_local(i)
+       new(iloc)=all_rect(HYMAP3_routing_struc(n)%catchment_rect_index(gid))
+    enddo
+    call move_alloc(new,var)
+  end subroutine HYMAP3_catchment_reorder_int1
+
+  subroutine HYMAP3_catchment_reorder1(n,var)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_routingMod
+    implicit none
+    integer, intent(in) :: n
+    real, allocatable, intent(inout) :: var(:)
+    real, allocatable :: all_rect(:),new(:)
+    integer :: i,gid,iloc,status
+    if(size(var)/=LIS_rc%nroutinggrid(n))then
+       write(*,*) '[ERR] Catchment parameter/state size mismatch', &
+            size(var),LIS_rc%nroutinggrid(n)
+       error stop 1
+    endif
+    allocate(all_rect(LIS_rc%glbnroutinggrid(n)))
+#if (defined SPMD)
+    call MPI_ALLGATHERV(var,LIS_rc%nroutinggrid(n),MPI_REAL,all_rect, &
+         LIS_routing_gdeltas(n,:),LIS_routing_goffsets(n,:),MPI_REAL, &
+         LIS_mpi_comm,status)
+#else
+    all_rect=var
+#endif
+    allocate(new(size(HYMAP3_routing_struc(n)%catchment_transfer%recv_gid)))
+    do i=1,size(new)
+       gid=HYMAP3_routing_struc(n)%catchment_transfer%recv_gid(i)
+       iloc=HYMAP3_routing_struc(n)%catchment_transfer%recv_local(i)
+       new(iloc)=all_rect(HYMAP3_routing_struc(n)%catchment_rect_index(gid))
+    enddo
+    call move_alloc(new,var)
+  end subroutine HYMAP3_catchment_reorder1
+
+  subroutine HYMAP3_catchment_reorder2(n,var)
+    use LIS_coreMod
+    implicit none
+    integer, intent(in) :: n
+    real, allocatable, intent(inout) :: var(:,:)
+    real, allocatable :: new(:,:),column(:)
+    integer :: j
+    allocate(new(size(HYMAP3_routing_struc(n)%catchment_transfer%recv_gid),size(var,2)))
+    do j=1,size(var,2)
+       allocate(column(size(var,1)))
+       column=var(:,j)
+       call HYMAP3_catchment_reorder1(n,column)
+       new(:,j)=column
+       deallocate(column)
+    enddo
+    call move_alloc(new,var)
+  end subroutine HYMAP3_catchment_reorder2
+
+  subroutine HYMAP3_catchment_reorder3(n,var)
+    implicit none
+    integer, intent(in) :: n
+    real, allocatable, intent(inout) :: var(:,:,:)
+    real, allocatable :: new(:,:,:),column(:)
+    integer :: j,k
+    allocate(new(size(HYMAP3_routing_struc(n)%catchment_transfer%recv_gid), &
+         size(var,2),size(var,3)))
+    do k=1,size(var,3)
+       do j=1,size(var,2)
+          allocate(column(size(var,1)))
+          column=var(:,j,k)
+          call HYMAP3_catchment_reorder1(n,column)
+          new(:,j,k)=column
+          deallocate(column)
+       enddo
+    enddo
+    call move_alloc(new,var)
+  end subroutine HYMAP3_catchment_reorder3
+
+  !ag(22Nov2026) One-field forcing map, usable for evaporation/meteorology
+  ! and gridded runoff from LIS (same global cell index, no interpolation).
+  subroutine HYMAP3_catchment_extract_grid(n,grid,vector)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    real, intent(in) :: grid(:,:)
+    real, intent(out) :: vector(:)
+    real, allocatable :: input(:,:,:),output(:,:)
+    integer :: ierr
+    allocate(input(size(grid,1),size(grid,2),1),output(1,size(vector)))
+    input(:,:,1)=grid
+    call HYMAP3_catchment_forward(HYMAP3_routing_struc(n)%catchment_transfer, &
+         HYMAP3_routing_struc(n)%catchment_gx,HYMAP3_routing_struc(n)%catchment_gy, &
+         LIS_ews_halo_ind(n,LIS_localPet+1),LIS_nss_halo_ind(n,LIS_localPet+1), &
+         input,output,ierr)
+    if(ierr/=0)then
+       write(LIS_logunit,*) '[ERR] Catchment grid-to-vector MPI transfer',ierr
+       call LIS_endrun()
+    endif
+    vector=output(1,:)
+  end subroutine HYMAP3_catchment_extract_grid
+
+  !ag(22Nov2026) Reverse transfer to LIS original rectangles for history,
+  ! two-way coupling, and any gridded output. Return a complete local grid.
+  subroutine HYMAP3_catchment_restore_grid(n,vector,grid)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    real, intent(in) :: vector(:)
+    real, intent(out) :: grid(:,:)
+    real, allocatable :: input(:,:),output(:,:,:)
+    integer :: ierr
+    allocate(input(1,size(vector)),output(size(grid,1),size(grid,2),1))
+    input(1,:)=vector
+    call HYMAP3_catchment_reverse(HYMAP3_routing_struc(n)%catchment_transfer, &
+         HYMAP3_routing_struc(n)%catchment_gx,HYMAP3_routing_struc(n)%catchment_gy, &
+         LIS_ews_halo_ind(n,LIS_localPet+1),LIS_nss_halo_ind(n,LIS_localPet+1), &
+         input,output,real(HYMAP3_routing_struc(n)%imis),ierr)
+    if(ierr/=0)then
+       write(LIS_logunit,*) '[ERR] Catchment vector-to-grid MPI transfer',ierr
+       call LIS_endrun()
+    endif
+    grid=output(:,:,1)
+  end subroutine HYMAP3_catchment_restore_grid
+
+  subroutine HYMAP3_catchment_transfer_runoff(n,m,runoff_grid,baseflow_grid)
+    use LIS_coreMod
+    use LIS_logMod
+    use LIS_mpiMod
+    implicit none
+    integer, intent(in) :: n,m
+    real, intent(in) :: runoff_grid(:,:),baseflow_grid(:,:)
+    real, allocatable :: grid(:,:,:),vec(:,:)
+    integer :: ierr
+
+    if(HYMAP3_routing_struc(n)%catchment_preview_flag/=1)return
+    if(m<1.or.m>size(HYMAP3_routing_struc(n)%catchment_runoff,2))then
+       write(LIS_logunit,*) '[ERR] HYMAP3 catchment forcing: invalid ensemble',m
+       call LIS_endrun()
+    endif
+    if(any(shape(runoff_grid)/=shape(baseflow_grid)).or. &
+         size(runoff_grid,1)/=LIS_rc%lnc(n).or. &
+         size(runoff_grid,2)/=LIS_rc%lnr(n))then
+       write(LIS_logunit,*) '[ERR] HYMAP3 catchment forcing: invalid grid shape'
+       call LIS_endrun()
+    endif
+    allocate(grid(LIS_rc%lnc(n),LIS_rc%lnr(n),2))
+    allocate(vec(2,size(HYMAP3_routing_struc(n)%catchment_transfer%recv_gid)))
+    grid(:,:,1)=runoff_grid
+    grid(:,:,2)=baseflow_grid
+    call HYMAP3_catchment_forward( &
+         HYMAP3_routing_struc(n)%catchment_transfer, &
+         HYMAP3_routing_struc(n)%catchment_gx, &
+         HYMAP3_routing_struc(n)%catchment_gy, &
+         LIS_ews_halo_ind(n,LIS_localPet+1), &
+         LIS_nss_halo_ind(n,LIS_localPet+1),grid,vec,ierr)
+    if(ierr/=0)then
+       write(LIS_logunit,*) '[ERR] HYMAP3 catchment forcing MPI exchange',ierr
+       call LIS_endrun()
+    endif
+    HYMAP3_routing_struc(n)%catchment_runoff(:,m)=vec(1,:)
+    HYMAP3_routing_struc(n)%catchment_baseflow(:,m)=vec(2,:)
+  end subroutine HYMAP3_catchment_transfer_runoff
+
   subroutine HYMAP3_vector_read_dims(n)
 
     !USES:
@@ -4428,7 +5159,7 @@ contains
     implicit none
 
     integer, intent(in)     :: n
-    integer, intent(in)     :: var(LIS_rc%nroutinggrid(n))
+    integer, intent(in)     :: var(:)
     integer, intent(out)    :: var_glb(LIS_rc%glbnroutinggrid(n))
 
     integer        :: tmpvar(LIS_rc%glbnroutinggrid(n))
@@ -4439,6 +5170,23 @@ contains
     external :: MPI_ALLGATHERV
 #endif
 
+    !ag(22Nov2026) Keep permanent river-ID order for integer globals.
+    if(HYMAP3_routing_struc(n)%catchment_initialized)then
+#if (defined SPMD)
+       call MPI_ALLGATHERV(var,size(var),MPI_INTEGER,tmpvar, &
+            HYMAP3_routing_struc(n)%catchment_counts, &
+            HYMAP3_routing_struc(n)%catchment_offsets,MPI_INTEGER, &
+            LIS_mpi_comm,status)
+#else
+       tmpvar(1:size(var))=var
+#endif
+       do i=1,LIS_rc%glbnroutinggrid(n)
+          l=HYMAP3_routing_struc(n)%network%owner(i)
+          var_glb(i)=tmpvar(HYMAP3_routing_struc(n)%catchment_offsets(l)+ &
+               HYMAP3_routing_struc(n)%network%gl2local(i))
+       enddo
+       return
+    endif
 #if (defined SPMD)
     call MPI_ALLGATHERV(var,&
          LIS_rc%nroutinggrid(n),&
@@ -4482,10 +5230,12 @@ contains
     integer, intent(in) :: n
     integer :: ng, nl, rank, np, p, k, gid, gd, ix, iy, idx
     integer :: sr, dr, loc, j
-    integer, allocatable :: adj_pos(:),cursor_out(:),cursor_in(:)
+    integer, allocatable :: adj_pos(:),cursor_out(:),cursor_in(:),proc_local(:)
 
     ng=LIS_rc%glbnroutinggrid(n)
     nl=LIS_rc%nroutinggrid(n)
+    if(HYMAP3_routing_struc(n)%catchment_active) &
+         nl=HYMAP3_routing_struc(n)%nseqall
     rank=LIS_localPet
     np=LIS_npes
     associate(plan => HYMAP3_routing_struc(n)%network)
@@ -4501,6 +5251,20 @@ contains
       plan%remote_down_slot=0
       plan%remote_up_slot=0
 
+      !ag(22Nov2026) Catchment elements are ordered by global river ID
+      ! within each owner. The legacy LIS rectangles remain the default.
+      if(HYMAP3_routing_struc(n)%catchment_active)then
+         plan%owner=HYMAP3_routing_struc(n)%catchment_owner
+         allocate(proc_local(0:np-1))
+         proc_local=0
+         do gid=1,ng
+            p=plan%owner(gid)
+            proc_local(p)=proc_local(p)+1
+            plan%gl2local(gid)=proc_local(p)
+            if(p==rank)plan%local2gl(plan%gl2local(gid))=gid
+         enddo
+         deallocate(proc_local)
+      else
       ! Rebuild the global-index-to-owner table once from LIS' existing
       ! rank-order sequence. The full arrays are NOT gathered per timestep.
       do p=0,np-1
@@ -4529,6 +5293,7 @@ contains
             if(p==rank)plan%local2gl(k)=gid
          enddo
       enddo
+      endif  !ag(22Nov2026) active catchment ownership / original rectangles
       if(any(plan%owner<0).or.any(plan%local2gl<1))then
          write(LIS_logunit,*) '[ERR] network MPI: incomplete LIS ownership mapping'
          call LIS_endrun()
@@ -5048,6 +5813,7 @@ contains
 
     ng=LIS_rc%glbnroutinggrid(n)
     nl=LIS_rc%nroutinggrid(n)
+    if(HYMAP3_routing_struc(n)%catchment_active)nl=HYMAP3_routing_struc(n)%nseqall
     np=LIS_npes
     rank=LIS_localPet
     associate(plan => HYMAP3_routing_struc(n)%network)
@@ -5267,7 +6033,7 @@ contains
     implicit none
 
     integer, intent(in)        :: n
-    real, intent(in)           :: var(LIS_rc%nroutinggrid(n))
+    real, intent(in)           :: var(:)
     real, intent(out)          :: var_glb(LIS_rc%glbnroutinggrid(n))
 
     real           :: tmpvar(LIS_rc%glbnroutinggrid(n))
@@ -5278,6 +6044,24 @@ contains
     external :: MPI_ALLGATHERV
 #endif
 
+    !ag(22Nov2026) Catchment-owned vectors are collected in owner order,
+    ! then restored to permanent global river IDs. LIS tile counts unchanged.
+    if(HYMAP3_routing_struc(n)%catchment_initialized)then
+#if (defined SPMD)
+       call MPI_ALLGATHERV(var,size(var),MPI_REAL,tmpvar, &
+            HYMAP3_routing_struc(n)%catchment_counts, &
+            HYMAP3_routing_struc(n)%catchment_offsets,MPI_REAL, &
+            LIS_mpi_comm,status)
+#else
+       tmpvar(1:size(var))=var
+#endif
+       do i=1,LIS_rc%glbnroutinggrid(n)
+          l=HYMAP3_routing_struc(n)%network%owner(i)
+          var_glb(i)=tmpvar(HYMAP3_routing_struc(n)%catchment_offsets(l)+ &
+               HYMAP3_routing_struc(n)%network%gl2local(i))
+       enddo
+       return
+    endif
 #if (defined SPMD)
     call MPI_ALLGATHERV(var,&
          LIS_rc%nroutinggrid(n),&
@@ -5323,10 +6107,16 @@ contains
 
     integer, intent(in) :: n
     real, intent(in)    :: var_glb(LIS_rc%glbnroutinggrid(n))
-    real, intent(out)   :: var_local(LIS_rc%nroutinggrid(n))
+    real, intent(out)   :: var_local(:)
 
     integer             :: i, ix,iy,ix1,iy1
 
+    if(HYMAP3_routing_struc(n)%catchment_initialized)then
+       do i=1,size(var_local)
+          var_local(i)=var_glb(HYMAP3_routing_struc(n)%network%local2gl(i))
+       enddo
+       return
+    endif
     do i=1,LIS_rc%nroutinggrid(n)
        ix = HYMAP3_routing_struc(n)%seqx(i)
        iy = HYMAP3_routing_struc(n)%seqy(i)
@@ -5361,6 +6151,16 @@ contains
 
     integer              :: ix,iy,iloc(1)
 
+    if(HYMAP3_routing_struc(n)%catchment_initialized)then
+       local_index=HYMAP3_routing_struc(n)%imis
+       if(glb_x<1.or.glb_x>LIS_rc%gnc(n).or. &
+            glb_y<1.or.glb_y>LIS_rc%gnr(n))return
+       ix=HYMAP3_routing_struc(n)%sindex(glb_x,glb_y)
+       if(ix<1)return
+       if(HYMAP3_routing_struc(n)%network%owner(ix)==LIS_localPet) &
+            local_index=HYMAP3_routing_struc(n)%network%gl2local(ix)
+       return
+    endif
     ix = glb_x - LIS_ews_halo_ind(n,LIS_localPet+1) + 1
     iy = glb_y - LIS_nss_halo_ind(n,LIS_localPet+1) + 1
 
@@ -5397,6 +6197,10 @@ contains
 
     integer             :: ix,iy,ix1,iy1
 
+    if(HYMAP3_routing_struc(n)%catchment_initialized)then
+       glb_index=HYMAP3_routing_struc(n)%network%local2gl(local_index)
+       return
+    endif
     ix = HYMAP3_routing_struc(n)%seqx(local_index)
     iy = HYMAP3_routing_struc(n)%seqy(local_index)
     ix1 = ix + LIS_ews_halo_ind(n,LIS_localPet+1) -1
@@ -5800,5 +6604,127 @@ contains
     enddo
 
   end subroutine HYMAP3_insert_candidate_topk
+
+  !ag(23Nov2026) Report processor load and actual upstream/downstream
+  ! cross-rank river links for the existing rectangular LIS decomposition
+  ! and, when available, for catchment decomposition. A cross-rank river
+  ! edge is counted once, not once per MPI message or geometric neighbor.
+  ! This routine is called on the master after initialization only.
+  subroutine HYMAP3_report_decomposition(n)
+    use LIS_coreMod
+    use LIS_mpiMod
+    use LIS_logMod
+    implicit none
+    integer, intent(in) :: n
+    integer :: np,ng,ierr,p,nrect,ncatch,ii
+    integer, allocatable :: rect_owner(:),rload(:),rout(:),rin(:),rcell(:),rflag(:)
+    integer, allocatable :: cload(:),cout(:),cin(:),ccell(:),cflag(:)
+    character(160) :: message
+    character(16) :: method
+    character(1024) :: outfile
+    character(1024) :: nc_error
+    character(256) :: filename
+    character(512) :: ncdir
+    logical :: hascatch
+
+    np=LIS_npes
+    ng=LIS_rc%glbnroutinggrid(n)
+    allocate(rect_owner(ng),rload(np),rout(np),rin(np),rcell(np),rflag(ng))
+    call HYMAP3_catchment_map_sources( &
+         HYMAP3_routing_struc(n)%sindex,np, &
+         LIS_ews_ind(n,:),LIS_ewe_ind(n,:), &
+         LIS_nss_ind(n,:),LIS_nse_ind(n,:),rect_owner,ierr,message)
+    if(ierr/=0)then
+       write(LIS_logunit,*) '[ERR] HYMAP3 decomposition rectangular map: ',trim(message)
+       call LIS_endrun()
+    endif
+    call HYMAP3_decomp_count(HYMAP3_routing_struc(n)%next_glb, &
+         HYMAP3_routing_struc(n)%outlet_glb,rect_owner,np, &
+         rload,rout,rin,rcell,rflag,nrect,ierr)
+    if(ierr/=0)then
+       write(LIS_logunit,*) '[ERR] HYMAP3 decomposition rectangular count:',ierr
+       call LIS_endrun()
+    endif
+    hascatch=allocated(HYMAP3_routing_struc(n)%catchment_owner)
+    if(hascatch)then
+       allocate(cload(np),cout(np),cin(np),ccell(np),cflag(ng))
+       call HYMAP3_decomp_count(HYMAP3_routing_struc(n)%next_glb, &
+            HYMAP3_routing_struc(n)%outlet_glb, &
+            HYMAP3_routing_struc(n)%catchment_owner,np, &
+            cload,cout,cin,ccell,cflag,ncatch,ierr)
+       if(ierr/=0)then
+          write(LIS_logunit,*) '[ERR] HYMAP3 decomposition catchment count:',ierr
+          call LIS_endrun()
+       endif
+    endif
+    if(HYMAP3_routing_struc(n)%catchment_active)then
+       method='catchment'
+    else
+       method='rectangular'
+    endif
+    write(LIS_logunit,*) '[INFO] HYMAP3 decomposition: nest/mode/ranks/river cells', &
+         n,trim(method),np,ng
+    write(LIS_logunit,*) '[INFO] HYMAP3 decomposition RECTANGULAR: total cross-rank river links',nrect
+    write(LIS_logunit,*) '[INFO] HYMAP3 decomposition RECTANGULAR: rank / river cells / out links / in links / unique boundary cells'
+    do p=0,np-1
+       write(LIS_logunit,'(a,5i12)') '[INFO] HYMAP3 decomposition rectangular ', &
+            p,rload(p+1),rout(p+1),rin(p+1),rcell(p+1)
+    enddo
+    if(hascatch)then
+       write(LIS_logunit,*) '[INFO] HYMAP3 decomposition CATCHMENT: total cross-rank river links',ncatch
+       write(LIS_logunit,*) &
+            '[INFO] HYMAP3 decomposition CATCHMENT: rank / cells / out links / in links / boundary cells'
+       do p=0,np-1
+          write(LIS_logunit,'(a,5i12)') '[INFO] HYMAP3 decomposition catchment   ', &
+               p,cload(p+1),cout(p+1),cin(p+1),ccell(p+1)
+       enddo
+       if(nrect>0)then
+          write(LIS_logunit,'(a,f9.2,a)') &
+               '[INFO] HYMAP3 decomposition cross-rank link reduction: ', &
+               100.0*real(nrect-ncatch)/real(nrect),' percent'
+       else
+          write(LIS_logunit,*) '[INFO] HYMAP3 decomposition: zero rectangular cuts; reduction undefined'
+       endif
+    endif
+    if(HYMAP3_routing_struc(n)%decomposition_nc_flag/=1)return
+    write(filename,'(a,i2.2,a,a)') 'HYMAP3_decomposition_nest',n,'_', &
+         trim(method)//'.nc'
+    ncdir=trim(adjustl(HYMAP3_routing_struc(n)%decomposition_nc_dir))
+    if(len_trim(ncdir)==0.or.trim(ncdir)=='.')then
+       outfile=trim(filename)
+    else
+       outfile=trim(ncdir)//'/'//trim(filename)
+    endif
+    nc_error=''
+    if(HYMAP3_routing_struc(n)%catchment_active.and.hascatch)then
+       if(allocated(LIS_domain(n)%glon).and.allocated(LIS_domain(n)%glat))then
+          call HYMAP3_decomp_write_nc(trim(outfile), &
+               HYMAP3_routing_struc(n)%sindex, &
+               HYMAP3_routing_struc(n)%catchment_owner,cflag,ierr, &
+               LIS_domain(n)%glon,LIS_domain(n)%glat,nc_error)
+       else
+          call HYMAP3_decomp_write_nc(trim(outfile), &
+               HYMAP3_routing_struc(n)%sindex, &
+               HYMAP3_routing_struc(n)%catchment_owner,cflag,ierr,errmsg=nc_error)
+       endif
+    else
+       if(allocated(LIS_domain(n)%glon).and.allocated(LIS_domain(n)%glat))then
+          call HYMAP3_decomp_write_nc(trim(outfile), &
+               HYMAP3_routing_struc(n)%sindex,rect_owner,rflag,ierr, &
+               LIS_domain(n)%glon,LIS_domain(n)%glat,nc_error)
+       else
+          call HYMAP3_decomp_write_nc(trim(outfile), &
+               HYMAP3_routing_struc(n)%sindex,rect_owner,rflag,ierr,errmsg=nc_error)
+       endif
+    endif
+    if(ierr/=0)then
+       !ag(23Nov2026) Optional diagnostics should not terminate a valid
+       ! simulation if the filesystem or NetCDF library rejects the file.
+       write(LIS_logunit,*) '[WARN] HYMAP3 decomposition NetCDF not written:',trim(outfile)
+       write(LIS_logunit,*) '[WARN] NetCDF diagnostic: ',trim(nc_error),' (',ierr,')'
+       return
+    endif
+    write(LIS_logunit,*) '[INFO] HYMAP3 decomposition NetCDF written:',trim(outfile)
+  end subroutine HYMAP3_report_decomposition
 
 end module HYMAP3_routingMod
